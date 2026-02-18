@@ -1,0 +1,53 @@
+---
+# Main tasks for Kafka Broker deployment
+
+- name: Display deployment info
+  debug:
+    msg: "Deploying Kafka Broker on {{ ansible_fqdn }}"
+
+- name: Load encrypted secrets
+  include_vars:
+    file: broker-secret.yml
+  when: load_secrets | bool
+  tags: secrets
+
+- name: Create user and group
+  include_tasks: create_user.yml
+  when: create_broker_user | bool
+  tags: user
+
+- name: Create directories
+  include_tasks: create_directories.yml
+  tags: directories
+
+- name: Extract and install Confluent
+  include_tasks: install_confluent.yml
+  tags: install
+
+- name: Setup Prometheus JMX Exporter
+  include_tasks: setup_prometheus.yml
+  when: prometheus_jmx_exporter_enabled | bool
+  tags: prometheus
+
+- name: Configure Kafka Broker
+  include_tasks: configure.yml
+  tags: configure
+
+- name: Append encrypted secrets to server.properties
+  include_tasks: append_secrets.yml
+  when: load_secrets | bool
+  tags: secrets
+
+- name: Configure systemd service
+  include_tasks: configure_service.yml
+  tags: service
+
+- name: Start Kafka Broker service
+  include_tasks: start_service.yml
+  when: start_broker | bool
+  tags: start
+
+- name: Validate deployment
+  include_tasks: validate.yml
+  when: validate_deployment | bool
+  tags: validate

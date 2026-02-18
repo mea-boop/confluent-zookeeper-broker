@@ -1,0 +1,62 @@
+---
+# Configure Kafka Broker
+
+- name: Set Broker ID based on hostname
+  set_fact:
+    broker_id: "{{ groups['broker_nodes'].index(inventory_hostname) + 1 }}"
+    cacheable: yes
+
+- name: Display Broker ID
+  debug:
+    msg: "Broker ID {{ broker_id }} assigned to {{ ansible_fqdn }}"
+
+- name: Verify all nodes have FQDN
+  assert:
+    that:
+      - hostvars[item]['ansible_fqdn'] is defined
+      - hostvars[item]['ansible_fqdn'] != ''
+    fail_msg: "FQDN not found for {{ item }}"
+    success_msg: "FQDN verified: {{ hostvars[item]['ansible_fqdn'] }}"
+  loop: "{{ groups['broker_nodes'] }}"
+  run_once: true
+
+- name: Display broker configuration
+  debug:
+    msg: |
+      Broker Configuration:
+      {% for host in groups['broker_nodes'] %}
+      - ID: {{ hostvars[host]['broker_id'] }}, Host: {{ hostvars[host]['ansible_fqdn'] }}
+      {% endfor %}
+  run_once: true
+
+- name: Create Kafka config directory
+  file:
+    path: "{{ broker_config_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0755'
+
+- name: Create server.properties from template
+  template:
+    src: server.properties.j2
+    dest: "{{ broker_config_dir }}/server.properties"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0644'
+
+- name: Create environment script
+  template:
+    src: kafka-broker-env.sh.j2
+    dest: "{{ broker_install_dir }}/bin/kafka-broker-env.sh"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0755'
+
+- name: Create log4j properties
+  template:
+    src: log4j.properties.j2
+    dest: "{{ broker_config_dir }}/log4j.properties"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0644'

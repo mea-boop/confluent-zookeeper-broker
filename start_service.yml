@@ -1,0 +1,18 @@
+---
+# Start Kafka Broker service
+
+- name: Enable Kafka Broker service
+  systemd:
+    name: "{{ broker_service_name }}"
+    enabled: yes
+
+- name: Start Kafka Broker service
+  systemd:
+    name: "{{ broker_service_name }}"
+    state: started
+
+- name: Wait for Kafka Broker port
+  wait_for:
+    port: "{{ broker_client_port }}"
+    delay: 15
+    timeout: 120

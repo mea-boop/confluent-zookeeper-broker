@@ -1,0 +1,39 @@
+---
+# Create required directories
+
+- name: Create Kafka broker data directory
+  file:
+    path: "{{ broker_data_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0755'
+    recurse: yes
+
+- name: Create Kafka broker log directory
+  file:
+    path: "{{ broker_log_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0755'
+    recurse: yes
+
+- name: Create Prometheus directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0755'
+  loop:
+    - /opt/prometheus
+    - /opt/prometheus/prometheus-config
+
+- name: Create SSL directory (if needed)
+  file:
+    path: "{{ broker_install_dir }}/etc/kafka/ssl"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0700'
