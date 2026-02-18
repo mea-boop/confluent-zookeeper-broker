@@ -1,0 +1,10 @@
+---
+# Default variables - lowest precedence, override via group_vars or AAP extra vars
+
+install_java: false
+create_broker_user: true
+configure_firewall: false
+start_broker: true
+enable_broker: true
+validate_deployment: true
+prometheus_jmx_exporter_enabled: true

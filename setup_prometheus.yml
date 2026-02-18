@@ -1,0 +1,22 @@
+---
+# ==============================================================================
+# Setup Prometheus JMX Exporter for Kafka Broker
+# Mirrors: roles/zookeeper/tasks/setup_prometheus.yml
+# ==============================================================================
+
+- name: Copy Prometheus JMX Exporter JAR from controller to broker
+  ansible.builtin.copy:
+    src: "jmx_prometheus_javaagent-{{ prometheus_jmx_exporter_version }}.jar"
+    dest: "{{ prometheus_jmx_exporter_jar }}"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0644"
+
+- name: Deploy Prometheus JMX exporter metrics config for Kafka broker
+  ansible.builtin.template:
+    src: jmx-kafka-broker-prometheus.yml.j2
+    dest: "{{ prometheus_jmx_config }}"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0644"
+  notify: restart confluent-kafka

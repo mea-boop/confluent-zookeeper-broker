@@ -1,0 +1,18 @@
+---
+# ==============================================================================
+# Configure systemd service for Kafka Broker
+# Mirrors: roles/zookeeper/tasks/configure_service.yml
+# ==============================================================================
+
+- name: Create systemd service file for confluent-kafka
+  ansible.builtin.template:
+    src: confluent-kafka.service.j2
+    dest: "/etc/systemd/system/{{ broker_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true

@@ -1,0 +1,43 @@
+---
+# ==============================================================================
+# Confluent Kafka Broker Deployment Playbook
+# Hosts defined in Ansible Automation Platform - no static inventory file
+# Target group: broker_nodes
+# Mirrors: playbooks/deploy_zookeeper.yml pattern
+# ==============================================================================
+
+- name: Deploy Confluent Kafka Broker Cluster
+  hosts: broker_nodes
+  become: true
+  gather_facts: true
+  serial: 1                   # Rolling deploy - one broker at a time
+
+  roles:
+    - broker
+
+  post_tasks:
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Kafka Broker Deployment Complete
+          ============================================
+          Nodes:
+          {% for host in groups['broker_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }} (ID: {{ hostvars[host]['broker_id'] }})
+          {% endfor %}
+
+          Configuration:
+          - Install Dir  : {{ broker_install_dir }}
+          - Data Dir     : {{ broker_data_dir }}
+          - Log Dir      : {{ broker_log_dir }}
+          - Config Dir   : {{ broker_config_dir }}
+          - Secrets Dir  : {{ broker_secrets_dir }}
+          - SASL_SSL Port: {{ kafka_sasl_ssl_port }}
+          - TOKEN Port   : {{ kafka_token_port }}
+          - AD Port      : {{ kafka_ad_port }}
+          - MDS Port     : {{ kafka_mds_port }}
+          - JMX Port     : {{ kafka_jmx_port }}
+          - Prometheus   : {{ prometheus_jmx_exporter_port }}
+          ============================================
+      run_once: true
