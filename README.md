@@ -51,7 +51,6 @@
           ============================================
       run_once: true
 
-
 ---
 # ==============================================================================
 # Confluent Kafka Broker - Intelligent Rolling Restart Playbook
