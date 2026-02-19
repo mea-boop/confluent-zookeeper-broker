@@ -1,0 +1,20 @@
+---
+# ==============================================================================
+# Create broker user and group
+# Mirrors: roles/zookeeper/tasks/create_user.yml
+# ==============================================================================
+
+- name: Create Kafka broker group
+  ansible.builtin.group:
+    name: "{{ broker_group }}"
+    state: present
+    system: true
+
+- name: Create Kafka broker user
+  ansible.builtin.user:
+    name: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    system: true
+    shell: /sbin/nologin
+    create_home: false
+    comment: "Confluent Kafka Broker User"
