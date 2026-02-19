@@ -1,218 +1,354 @@
-# confluent-zookeeper-broker
+---
+# ==============================================================================
+# Confluent Kafka Broker Deployment Playbook
+# Hosts  : broker_nodes group (defined in AAP inventory)
+# Secrets: group_vars/secret.yml  (Ansible Vault, password: humana#1)
+#
+# AAP Job Template requires TWO credentials:
+#   1. Machine credential  - SSH access to brokers
+#   2. Vault credential    - password humana#1  to decrypt group_vars/secret.yml
+#
+# What this playbook does (serial: 1 = rolling, one broker at a time):
+#   create_user → create_directories → install_confluent → setup_prometheus
+#   → deploy_secrets (writes /opt/secrets/local-secrets.properties)
+#   → configure → configure_service → start_service → validate
+# ==============================================================================
 
-### Step 5: Create AAP Custom Credential Type
+- name: Deploy Confluent Kafka Broker Cluster
+  hosts: broker_nodes
+  become: true
+  gather_facts: true
+  serial: 1
 
-Navigate to **Administration → Credential Types → Add**
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/secret.yml"
 
-**Name:** `Confluent Broker Secrets`
+  roles:
+    - broker
 
-**Input Configuration (YAML):**
-```yaml
-fields:
-  - id: confluent_license
-    type: string
-    label: Confluent License Key
-    secret: true
-  - id: kafka_admin_password
-    type: string
-    label: Kafka Admin SCRAM Password
-    secret: true
-  - id: ldap_bind_password
-    type: string
-    label: LDAP Bind Password
-    secret: true
-  - id: ssl_truststore_password
-    type: string
-    label: SSL Truststore Password
-    secret: true
-  - id: ssl_keystore_password
-    type: string
-    label: SSL Keystore Password
-    secret: true
-  - id: ssl_key_password
-    type: string
-    label: SSL Key Password
-    secret: true
-required:
-  - confluent_license
-  - kafka_admin_password
-  - ldap_bind_password
-  - ssl_truststore_password
-  - ssl_keystore_password
-  - ssl_key_password
-```
+  post_tasks:
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Kafka Broker Deployment Complete
+          ============================================
+          Nodes:
+          {% for host in groups['broker_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }} (ID: {{ hostvars[host]['broker_id'] }})
+          {% endfor %}
 
-**Injector Configuration (YAML):**
-```yaml
-extra_vars:
-  confluent_license: '{{ confluent_license }}'
-  kafka_admin_password: '{{ kafka_admin_password }}'
-  ldap_bind_password: '{{ ldap_bind_password }}'
-  ssl_truststore_password: '{{ ssl_truststore_password }}'
-  ssl_keystore_password: '{{ ssl_keystore_password }}'
-  ssl_key_password: '{{ ssl_key_password }}'
-```
+          Configuration:
+          - Install Dir  : {{ broker_install_dir }}
+          - Data Dir     : {{ broker_data_dir }}
+          - Config Dir   : {{ broker_config_dir }}
+          - Secrets File : {{ broker_secrets_dir }}/local-secrets.properties
+          - SASL_SSL Port: {{ kafka_sasl_ssl_port }}
+          - TOKEN Port   : {{ kafka_token_port }}
+          - AD Port      : {{ kafka_ad_port }}
+          - MDS Port     : {{ kafka_mds_port }}
+          - Prometheus   : {{ prometheus_jmx_exporter_port }}
+          ============================================
+      run_once: true
+
 
 ---
+# ==============================================================================
+# Confluent Kafka Broker - Intelligent Rolling Restart Playbook
+# Strategy: Restart non-leader brokers first, preferred-leader broker last
+# No shell or command modules - pure Ansible built-in modules only
+# Vault secrets loaded from: group_vars/secret.yml  (password: humana#1)
+# Vault password supplied by: AAP Vault credential (password: humana#1)
+# Mirrors: playbooks/restart_zookeeper.yml pattern
+# ==============================================================================
 
-### Step 6: Create Credential Instance
+# ------------------------------------------------------------------------------
+# PLAY 1: Discover cluster state - which broker holds most leader partitions
+# ------------------------------------------------------------------------------
+- name: Discover Broker Cluster State
+  hosts: broker_nodes
+  become: true
+  gather_facts: true
+  serial: "100%"
 
-Navigate to **Resources → Credentials → Add**
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/secret.yml"
 
-```
-Name            : Confluent_Broker_Secrets_prd
-Credential Type : Confluent Broker Secrets
-Organization    : Your Organization
-```
+  tasks:
+    - name: Resolve broker_id for this host
+      ansible.builtin.set_fact:
+        broker_id: "{{ broker_id_map[inventory_hostname] }}"
+        cacheable: true
 
-Fill in all secret field values. They are encrypted and stored in AAP's vault. **Never stored in Git.**
+    - name: Check confluent-kafka service status
+      ansible.builtin.systemd:
+        name: "{{ broker_service_name }}"
+      register: broker_service
+      failed_when: false
 
----
+    - name: Query MDS for cluster info
+      ansible.builtin.uri:
+        url: "https://{{ ansible_fqdn }}:{{ kafka_mds_port }}/v3/clusters"
+        method: GET
+        validate_certs: true
+        ca_path: "{{ ssl_truststore_location }}"
+        status_code: 200
+        return_content: true
+        timeout: 30
+      register: cluster_info
+      failed_when: false
+      when: broker_service.status.ActiveState == "active"
 
-### Step 7: Create SSH Machine Credential
+    - name: Parse cluster ID
+      ansible.builtin.set_fact:
+        kafka_cluster_id: >-
+          {{
+            (cluster_info.json.data | map(attribute='cluster_id') | list | first)
+            if (cluster_info is succeeded and cluster_info.json is defined)
+            else 'unknown'
+          }}
+      when: cluster_info is defined and cluster_info is succeeded
 
-Navigate to **Resources → Credentials → Add**
+    - name: Default cluster_id if MDS unavailable
+      ansible.builtin.set_fact:
+        kafka_cluster_id: "unknown"
+      when: kafka_cluster_id is not defined
 
-```
-Name                         : Kafka_Broker_SSH_prd
-Credential Type              : Machine
-Username                     : <SSH_USER>
-SSH Private Key              : (paste private key)
-Privilege Escalation Method  : sudo
-Privilege Escalation Username: root
-```
+    - name: Query MDS for leader partition count on this broker
+      ansible.builtin.uri:
+        url: "https://{{ ansible_fqdn }}:{{ kafka_mds_port }}/v3/clusters/{{ kafka_cluster_id }}/brokers/{{ broker_id }}/partition-replicas"
+        method: GET
+        validate_certs: true
+        ca_path: "{{ ssl_truststore_location }}"
+        status_code: 200
+        return_content: true
+        timeout: 60
+      register: partition_replicas
+      failed_when: false
+      when:
+        - broker_service.status.ActiveState == "active"
+        - kafka_cluster_id != 'unknown'
 
----
+    - name: Count leader partitions on this broker
+      ansible.builtin.set_fact:
+        leader_partition_count: >-
+          {{
+            (partition_replicas.json.data |
+             selectattr('is_leader', 'equalto', true) |
+             list | length)
+            if (partition_replicas is defined and partition_replicas is succeeded
+                and partition_replicas.json is defined)
+            else 0
+          }}
 
-### Step 8: Upload to Azure DevOps
+    - name: Set is_leader_broker flag (broker with most leaders restarts last)
+      ansible.builtin.set_fact:
+        is_leader_broker: "{{ leader_partition_count | int > 0 }}"
+        cacheable: true
 
-```bash
-cd broker-confluent-ansible
-git init
-git add .
-git commit -m "Initial: Confluent Kafka Broker Ansible"
-git remote add origin https://dev.azure.com/<org>/<project>/_git/broker-ansible
-git push -u origin main
-```
+    - name: Display broker role
+      ansible.builtin.debug:
+        msg: "{{ ansible_fqdn }} (ID: {{ broker_id }}) leads {{ leader_partition_count }} partition(s) — restart order: {{ 'LAST (leader broker)' if is_leader_broker else 'NORMAL' }}"
 
----
 
-### Step 9: Create Project in AAP
+# ------------------------------------------------------------------------------
+# PLAY 2: Restart non-leader brokers first (serial: 1)
+# ------------------------------------------------------------------------------
+- name: Restart Non-Leader Brokers First
+  hosts: broker_nodes
+  become: true
+  gather_facts: false
+  serial: 1
 
-Navigate to **Resources → Projects → Add**
+  tasks:
+    - name: Restart non-leader broker
+      when: not (is_leader_broker | default(false) | bool)
+      block:
+        - name: Display restart message
+          ansible.builtin.debug:
+            msg: "Restarting NON-LEADER broker: {{ ansible_fqdn }} (ID: {{ broker_id }})"
 
-```
-Name        : Confluent_Kafka_Broker_Deployment
-Description : Kafka Broker deployment automation
-Organization: Your Organization
+        - name: Stop confluent-kafka (controlled shutdown re-elects leaders)
+          ansible.builtin.systemd:
+            name: "{{ broker_service_name }}"
+            state: stopped
 
-SCM Type    : Git
-SCM URL     : https://dev.azure.com/<org>/<project>/_git/broker-ansible
-SCM Branch  : main
+        - name: Wait for SASL_SSL port to close
+          ansible.builtin.wait_for:
+            port: "{{ kafka_sasl_ssl_port }}"
+            state: stopped
+            timeout: "{{ broker_restart_timeout }}"
 
-SCM Update Options:
-☑ Clean
-☑ Update Revision on Launch
-```
+        - name: Pause {{ restart_wait_time }}s for leader election propagation
+          ansible.builtin.pause:
+            seconds: "{{ restart_wait_time }}"
 
-Click **Save** then **Sync**.
+        - name: Start confluent-kafka
+          ansible.builtin.systemd:
+            name: "{{ broker_service_name }}"
+            state: started
 
----
+        - name: Wait for SASL_SSL port {{ kafka_sasl_ssl_port }} to open
+          ansible.builtin.wait_for:
+            port: "{{ kafka_sasl_ssl_port }}"
+            state: started
+            delay: 5
+            timeout: "{{ broker_restart_timeout }}"
 
-### Step 10: Create Job Templates
+        - name: Wait for MDS port {{ kafka_mds_port }} to open
+          ansible.builtin.wait_for:
+            port: "{{ kafka_mds_port }}"
+            state: started
+            timeout: "{{ broker_restart_timeout }}"
 
-**Template 1 - Deploy Brokers:**
+        - name: Wait for Prometheus port {{ prometheus_jmx_exporter_port }} to open
+          ansible.builtin.wait_for:
+            port: "{{ prometheus_jmx_exporter_port }}"
+            state: started
+            timeout: "{{ broker_restart_timeout }}"
+          when: prometheus_jmx_exporter_enabled | bool
 
-```
-Name       : Deploy_Kafka_Broker_prd
-Job Type   : Run
-Inventory  : Kafka_Broker_prd_eastus2_az3
-Project    : Confluent_Kafka_Broker_Deployment
-Playbook   : playbooks/deploy_broker.yml
-Credentials: Kafka_Broker_SSH_prd
-             Confluent_Broker_Secrets_prd
-Verbosity  : 1 (Verbose)
+        - name: Assert broker service is healthy
+          ansible.builtin.systemd:
+            name: "{{ broker_service_name }}"
+          register: post_restart_status
 
-Options:
-☑ Enable Privilege Escalation
-☑ Enable Fact Storage
-```
+        - name: Verify broker running before moving to next host
+          ansible.builtin.assert:
+            that:
+              - post_restart_status.status.ActiveState == "active"
+              - post_restart_status.status.SubState == "running"
+            fail_msg: >-
+              ABORT: Broker {{ ansible_fqdn }} (ID: {{ broker_id }}) failed health check.
+              Rolling restart halted to protect cluster integrity.
+            success_msg: "Broker {{ ansible_fqdn }} (ID: {{ broker_id }}) restarted successfully."
 
-**Template 2 - Rolling Restart (Leader Last):**
+        - name: Pause {{ restart_wait_time }}s before next broker
+          ansible.builtin.pause:
+            seconds: "{{ restart_wait_time }}"
 
-```
-Name       : Restart_Kafka_Broker_prd
-Job Type   : Run
-Inventory  : Kafka_Broker_prd_eastus2_az3
-Project    : Confluent_Kafka_Broker_Deployment
-Playbook   : playbooks/restart_broker.yml
-Credentials: Kafka_Broker_SSH_prd
-             Confluent_Broker_Secrets_prd
-Verbosity  : 1 (Verbose)
+        - name: Display success
+          ansible.builtin.debug:
+            msg: "✓ {{ ansible_fqdn }} (non-leader) restarted successfully"
 
-Options:
-☑ Enable Privilege Escalation
-```
 
----
+# ------------------------------------------------------------------------------
+# PLAY 3: Restart the leader broker LAST
+# ------------------------------------------------------------------------------
+- name: Restart Leader Broker Last
+  hosts: broker_nodes
+  become: true
+  gather_facts: false
+  serial: 1
 
-### Step 11: Run Deployment
+  tasks:
+    - name: Restart leader broker
+      when: is_leader_broker | default(false) | bool
+      block:
+        - name: Display leader restart warning
+          ansible.builtin.debug:
+            msg: |
+              ⚠ Restarting LEADER broker: {{ ansible_fqdn }} (ID: {{ broker_id }})
+              ⚠ Kafka controlled.shutdown will trigger new leader election before stop
 
-1. Go to **Resources → Templates**
-2. Find `Deploy_Kafka_Broker_prd`
-3. Click **Launch**
-4. Monitor progress (15-20 minutes for full cluster)
+        - name: Pause 10s before leader restart
+          ansible.builtin.pause:
+            seconds: 10
 
----
+        - name: Stop confluent-kafka leader (controlled shutdown re-elects all leader partitions)
+          ansible.builtin.systemd:
+            name: "{{ broker_service_name }}"
+            state: stopped
 
-### Step 12: Verify Deployment
+        - name: Wait for SASL_SSL port to close
+          ansible.builtin.wait_for:
+            port: "{{ kafka_sasl_ssl_port }}"
+            state: stopped
+            timeout: "{{ broker_restart_timeout }}"
 
-After completion, check each broker:
+        - name: Pause {{ restart_wait_time }}s for new leader election to complete
+          ansible.builtin.pause:
+            seconds: "{{ restart_wait_time }}"
 
-**Service status:**
-```bash
-ssh broker1-east-az3.prd.eeh.humana.com
-sudo systemctl status confluent-kafka
-```
+        - name: Start confluent-kafka leader
+          ansible.builtin.systemd:
+            name: "{{ broker_service_name }}"
+            state: started
 
-**Listener ports:**
-```bash
-ss -tlnp | grep -E '9093|9092|9094|8090|7071'
-```
+        - name: Wait for SASL_SSL port {{ kafka_sasl_ssl_port }} to open
+          ansible.builtin.wait_for:
+            port: "{{ kafka_sasl_ssl_port }}"
+            state: started
+            delay: 5
+            timeout: "{{ broker_restart_timeout }}"
 
-**Prometheus metrics:**
-```bash
-curl http://broker1-east-az3.prd.eeh.humana.com:7071/metrics | grep kafka_
-```
+        - name: Wait for MDS port {{ kafka_mds_port }} to open
+          ansible.builtin.wait_for:
+            port: "{{ kafka_mds_port }}"
+            state: started
+            timeout: "{{ broker_restart_timeout }}"
 
-**MDS API:**
-```bash
-curl -k https://broker1-east-az3.prd.eeh.humana.com:8090/v1/metadata/id
-```
+        - name: Wait for Prometheus port {{ prometheus_jmx_exporter_port }} to open
+          ansible.builtin.wait_for:
+            port: "{{ prometheus_jmx_exporter_port }}"
+            state: started
+            timeout: "{{ broker_restart_timeout }}"
+          when: prometheus_jmx_exporter_enabled | bool
 
----
+        - name: Assert leader broker is healthy
+          ansible.builtin.systemd:
+            name: "{{ broker_service_name }}"
+          register: leader_post_restart_status
 
-## Secret Flow Reference
+        - name: Verify leader broker running
+          ansible.builtin.assert:
+            that:
+              - leader_post_restart_status.status.ActiveState == "active"
+              - leader_post_restart_status.status.SubState == "running"
+            fail_msg: >-
+              Leader broker {{ ansible_fqdn }} (ID: {{ broker_id }}) failed health check after restart.
+            success_msg: "Leader broker {{ ansible_fqdn }} (ID: {{ broker_id }}) restarted successfully."
 
-```
-AAP Custom Credential (encrypted in AAP vault)
-    ↓ Credential Injector → extra_vars at job runtime
-Ansible plays in memory (never logged - no_log: true on secrets task)
-    ↓ ansible.builtin.template renders local-secrets.properties.j2
-/opt/secrets/local-secrets.properties (mode 0600, kafka:kafka)
-    ↓ Confluent SecurePass reads at JVM startup
-server.properties ${securepass:...} placeholders → JVM memory only
-```
+        - name: Display leader restart success
+          ansible.builtin.debug:
+            msg: "✓ {{ ansible_fqdn }} (leader) restarted successfully — new leader election complete"
 
-## Security Checklist
 
-| Item                                        | Location                | Status |
-|---------------------------------------------|-------------------------|--------|
-| Confluent License Key                       | AAP Custom Credential   | ✅     |
-| Kafka Admin SCRAM Password                  | AAP Custom Credential   | ✅     |
-| LDAP Bind Password                          | AAP Custom Credential   | ✅     |
-| SSL Truststore / Keystore / Key Passwords   | AAP Custom Credential   | ✅     |
-| SSH Private Key                             | AAP Machine Credential  | ✅     |
-| local-secrets.properties (plaintext values) | Broker disk / mode 0600 | ✅     |
-| server.properties (SecurePass refs only)    | Broker disk / mode 0640 | ✅     |
-| **Nothing sensitive in Azure DevOps Git**   | Azure DevOps            | ✅     |
+# ------------------------------------------------------------------------------
+# PLAY 4: Final cluster health verification
+# ------------------------------------------------------------------------------
+- name: Verify Cluster Health After Restart
+  hosts: broker_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Get final service status
+      ansible.builtin.systemd:
+        name: "{{ broker_service_name }}"
+      register: final_status
+
+    - name: Check all listener ports are open
+      ansible.builtin.wait_for:
+        host: "{{ ansible_fqdn }}"
+        port: "{{ item.port }}"
+        timeout: 30
+        state: started
+      loop:
+        - { port: "{{ kafka_sasl_ssl_port }}", name: "SASL_SSL" }
+        - { port: "{{ kafka_token_port }}",    name: "TOKEN" }
+        - { port: "{{ kafka_ad_port }}",       name: "AD" }
+        - { port: "{{ kafka_mds_port }}",      name: "MDS" }
+
+    - name: Display final cluster state
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Rolling Restart Complete
+          ============================================
+          {% for host in groups['broker_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }} (ID: {{ hostvars[host]['broker_id'] }}):
+            {{ hostvars[host]['final_status']['status']['ActiveState'] | default('unknown') }} / {{ hostvars[host]['final_status']['status']['SubState'] | default('unknown') }}
+          {% endfor %}
+          ============================================
+      run_once: true
