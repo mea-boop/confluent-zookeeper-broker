@@ -20,3 +20,23 @@
     group: "{{ broker_group }}"
     mode: "0644"
   notify: restart confluent-kafka
+
+==
+[Unit]
+Description=Apache Kafka - broker
+Documentation=http://docs.confluent.io/
+After=network.target confluent-zookeeper.target
+
+[Service]
+Type=simple
+User={{ broker_user }}
+Group={{ broker_group }}
+Environment="KAFKA_HEAP_OPTS={{ broker_heap_opts }}" "LOG_DIR={{ broker_log_dir }}" "KAFKA_LOG4J_OPTS=-Dlog4j.configuration=file:{{ broker_config_dir }}/log4j.properties" "JMX_PORT={{ kafka_jmx_port }}" "KAFKA_OPTS={{ java_agent_string }}" "CONFLUENT_SECURITY_MASTER_KEY={{ confluent_security_master_key }}"
+ExecStart={{ broker_install_dir }}/bin/kafka-server-start {{ broker_config_dir }}/server.properties
+LimitNOFILE=1000000
+TimeoutStopSec=180
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+
