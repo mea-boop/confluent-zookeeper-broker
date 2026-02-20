@@ -1,47 +1,65 @@
 ---
 # ==============================================================================
 # Configure Kafka Broker
-# Mirrors: roles/zookeeper/tasks/configure.yml
 # ==============================================================================
 
-- name: Resolve broker_id for this host from broker_id_map
+# ------------------------------------------------------------------
+# Re-load both var files here so configure.yml works even if called
+# independently. Vault decryption uses the AAP Vault credential.
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Load all.yml variables"
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/../group_vars/all.yml"
+
+- name: "CONFIGURE | Load vault_secrets.yml (decrypt with AAP Vault credential)"
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/../group_vars/vault_secrets.yml"
+  no_log: true
+
+# ------------------------------------------------------------------
+# Map vault_ variables to plain names for use in templates.
+# This is the same mapping as in all.yml - repeated here so the
+# template task always has the variables regardless of load order.
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Set plain-name vars from vault variables"
+  ansible.builtin.set_fact:
+    confluent_license:       "{{ vault_confluent_license }}"
+    kafka_admin_password:    "{{ vault_kafka_admin_password }}"
+    ldap_bind_password:      "{{ vault_ldap_bind_password }}"
+    ssl_truststore_password: "{{ vault_ssl_truststore_password }}"
+    ssl_keystore_password:   "{{ vault_ssl_keystore_password }}"
+    ssl_key_password:        "{{ vault_ssl_key_password }}"
+  no_log: true
+
+- name: "CONFIGURE | Resolve broker_id for {{ inventory_hostname }}"
   ansible.builtin.set_fact:
     broker_id: "{{ broker_id_map[inventory_hostname] }}"
     cacheable: true
 
-- name: Display broker identity
+- name: "CONFIGURE | Display broker identity"
   ansible.builtin.debug:
     msg: "Broker ID {{ broker_id }} assigned to {{ ansible_fqdn }}"
 
-- name: Verify all broker nodes have FQDN defined
+- name: "CONFIGURE | Verify all broker FQDNs are defined"
   ansible.builtin.assert:
     that:
       - hostvars[item]['ansible_fqdn'] is defined
       - hostvars[item]['ansible_fqdn'] != ''
     fail_msg: "FQDN not found for {{ item }}"
     success_msg: "FQDN verified: {{ hostvars[item]['ansible_fqdn'] }}"
-  loop: "{{ groups['broker_nodes'] }}"
+  loop: "{{ groups['all'] }}"
   run_once: true
 
-- name: Verify all broker nodes have broker_id_map entries
+- name: "CONFIGURE | Verify all broker_id_map entries exist"
   ansible.builtin.assert:
     that:
       - broker_id_map[item] is defined
     fail_msg: "broker_id_map entry missing for host: {{ item }}"
     success_msg: "broker_id_map[{{ item }}] = {{ broker_id_map[item] }}"
-  loop: "{{ groups['broker_nodes'] }}"
+  loop: "{{ groups['all'] }}"
   run_once: true
 
-- name: Display cluster listener configuration
-  ansible.builtin.debug:
-    msg: |
-      Broker Cluster Listener Configuration:
-      {% for host in groups['broker_nodes'] %}
-      broker_id={{ broker_id_map[host] }}  SASL_SSL={{ hostvars[host]['ansible_fqdn'] }}:{{ kafka_sasl_ssl_port }}  TOKEN={{ hostvars[host]['ansible_fqdn'] }}:{{ kafka_token_port }}  AD={{ hostvars[host]['ansible_fqdn'] }}:{{ kafka_ad_port }}
-      {% endfor %}
-  run_once: true
-
-- name: Create broker config directory
+- name: "CONFIGURE | Create broker config directory"
   ansible.builtin.file:
     path: "{{ broker_config_dir }}"
     state: directory
@@ -49,17 +67,73 @@
     group: "{{ broker_group }}"
     mode: "0755"
 
-- name: Deploy server.properties (SecurePass placeholders - no plaintext secrets)
+# ------------------------------------------------------------------
+# APPEND strategy for server.properties:
+#
+# Step 1 - Render the full template to a staging file in /tmp.
+# Step 2 - Read the staging file line by line.
+# Step 3 - For each "key=value" line in the staging file, check if
+#          the key already exists in the live server.properties.
+#          - If the key exists:  update the line in-place (lineinfile).
+#          - If the key is new:  append it to the file (lineinfile).
+# Step 4 - The live file is NEVER truncated or replaced, so any
+#          properties that were manually added or set by Confluent
+#          are preserved.
+# ------------------------------------------------------------------
+
+- name: "CONFIGURE | Render server.properties to staging file"
   ansible.builtin.template:
     src: server.properties.j2
-    dest: "{{ broker_config_dir }}/server.properties"
+    dest: /tmp/server.properties.staged
     owner: "{{ broker_user }}"
     group: "{{ broker_group }}"
     mode: "0640"
-    backup: true
+  no_log: true
+
+- name: "CONFIGURE | Ensure live server.properties exists"
+  ansible.builtin.file:
+    path: "{{ broker_config_dir }}/server.properties"
+    state: touch
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+
+- name: "CONFIGURE | Read staged server.properties into variable"
+  ansible.builtin.slurp:
+    src: /tmp/server.properties.staged
+  register: staged_props_raw
+
+- name: "CONFIGURE | Parse staged properties into list"
+  ansible.builtin.set_fact:
+    staged_lines: >-
+      {{
+        (staged_props_raw.content | b64decode).splitlines()
+        | select('match', '^[^#\\s].*=')
+        | list
+      }}
+
+- name: "CONFIGURE | Upsert each property into live server.properties"
+  ansible.builtin.lineinfile:
+    path: "{{ broker_config_dir }}/server.properties"
+    regexp: "^{{ item.split('=')[0] | regex_escape }}\\s*="
+    line: "{{ item }}"
+    state: present
+    create: true
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0640"
+  loop: "{{ staged_lines }}"
+  no_log: true
   notify: restart confluent-kafka
 
-- name: Deploy log4j.properties
+- name: "CONFIGURE | Remove staging file"
+  ansible.builtin.file:
+    path: /tmp/server.properties.staged
+    state: absent
+
+- name: "CONFIGURE | Deploy log4j.properties"
   ansible.builtin.template:
     src: log4j.properties.j2
     dest: "{{ broker_config_dir }}/log4j.properties"
@@ -68,7 +142,7 @@
     mode: "0644"
   notify: restart confluent-kafka
 
-- name: Deploy broker-env.sh (JVM, JMX, Prometheus environment)
+- name: "CONFIGURE | Deploy broker-env.sh"
   ansible.builtin.template:
     src: broker-env.sh.j2
     dest: "{{ broker_install_dir }}/bin/broker-env.sh"
