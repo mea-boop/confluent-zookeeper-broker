@@ -1,0 +1,43 @@
+---
+# ==============================================================================
+# setup_prometheus.yml
+#
+# Downloads Prometheus JMX Exporter from JFrog and deploys the metrics config.
+# ==============================================================================
+
+- name: "PROMETHEUS | Download Prometheus JMX Exporter zip from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/confluent/prometheus/prometheus.zip"
+    dest: /tmp/prometheus.zip
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0644'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_prometheus
+  until: dl_prometheus is succeeded
+
+- name: "PROMETHEUS | Extract Prometheus zip to /opt"
+  ansible.builtin.unarchive:
+    src: /tmp/prometheus.zip
+    dest: /opt
+    remote_src: true
+
+- name: "PROMETHEUS | Set Prometheus directory ownership and permissions"
+  ansible.builtin.file:
+    path: /opt/prometheus
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: '0766'
+    recurse: true
+
+- name: "PROMETHEUS | Deploy JMX exporter metrics config for Kafka broker"
+  ansible.builtin.template:
+    src: jmx-kafka-broker-prometheus.yml.j2
+    dest: "{{ prometheus_jmx_config }}"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0644"
+  notify: restart confluent-kafka

@@ -1,0 +1,237 @@
+---
+# ==============================================================================
+# install_confluent.yml
+#
+# Builds /etc/hosts entries, constructs bootstrap/zookeeper connect strings,
+# downloads all Confluent artifacts from JFrog, and installs the platform.
+# ==============================================================================
+
+# ---------- /etc/hosts entries ----------
+
+- name: "INSTALL | Add Kafka broker entries to /etc/hosts"
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ item.1 | trim }} {{ kafka_short }}{{ item.0 + 1 }}-messaging-az.{{ domain_name }}"
+    regexp: "{{ kafka_short }}{{ item.0 + 1 }}-messaging-az\\.{{ domain_name }}"
+    state: present
+  loop: "{{ kafka_broker_ips.split(',') | list | indexed }}"
+  loop_control:
+    label: "broker{{ item.0 + 1 }}"
+
+- name: "INSTALL | Add Zookeeper entries to /etc/hosts"
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ item.1 | trim }} {{ zk_node_name }}{{ item.0 + 1 }}-messaging-az.{{ domain_name }}"
+    regexp: "{{ zk_node_name }}{{ item.0 + 1 }}-messaging-az\\.{{ domain_name }}"
+    state: present
+  loop: "{{ zookeeper_ips.split(',') | list | indexed }}"
+  loop_control:
+    label: "zk{{ item.0 + 1 }}"
+
+# ---------- Build cluster connection strings ----------
+
+- name: "INSTALL | Build bootstrap servers string"
+  ansible.builtin.set_fact:
+    bstring: >-
+      {%- set brokers = [] -%}
+      {%- for idx in range(kafka_broker_ips.split(',') | length) -%}
+        {%- set _ = brokers.append(kafka_short ~ (idx + 1) | string ~ '-messaging-az.' ~ domain_name ~ ':' ~ kafka_sasl_ssl_port | string) -%}
+      {%- endfor -%}
+      {{ brokers | join(',') }}
+    cacheable: true
+
+- name: "INSTALL | Build Zookeeper connect string"
+  ansible.builtin.set_fact:
+    zookeeper_connect_dynamic: >-
+      {%- set zks = [] -%}
+      {%- for idx in range(zookeeper_ips.split(',') | length) -%}
+        {%- set _ = zks.append(zk_node_name ~ (idx + 1) | string ~ '-messaging-az.' ~ domain_name ~ ':2181') -%}
+      {%- endfor -%}
+      {{ zks | join(',') }}
+    cacheable: true
+
+# ---------- Download SSL certificates from JFrog ----------
+
+- name: "INSTALL | Download truststore.jks from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/certificates/truststore.jks"
+    dest: "{{ ssl_dir }}/truststore.jks"
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0644'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_truststore
+  until: dl_truststore is succeeded
+
+- name: "INSTALL | Download server keystore ({{ ssl_keystore_filename }}) from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/certificates/{{ ssl_keystore_filename }}"
+    dest: "{{ ssl_dir }}/{{ ssl_keystore_filename }}"
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0644'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_cert
+  until: dl_cert is succeeded
+
+- name: "INSTALL | Download chain root certificate from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/certificates/chainrootcertificate.cer"
+    dest: /etc/chainrootcertificate.cer
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0644'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_chain
+  until: dl_chain is succeeded
+
+- name: "INSTALL | Download MDS keypair PEM from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/certificates/certs/mdskeypair.pem"
+    dest: "{{ mds_keypair_path }}"
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0455'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_mdskey
+  until: dl_mdskey is succeeded
+
+- name: "INSTALL | Download MDS public PEM from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/certificates/certs/mdspublic.pem"
+    dest: "{{ mds_public_key_path }}"
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0455'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_mdspub
+  until: dl_mdspub is succeeded
+
+- name: "INSTALL | Set {{ ssl_dir }} ownership to {{ broker_user }}"
+  ansible.builtin.file:
+    path: "{{ ssl_dir }}"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    recurse: true
+
+# ---------- Download Confluent CLI from JFrog ----------
+
+- name: "INSTALL | Download Confluent CLI from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/confluent/cli/confluent"
+    dest: /tmp/confluent
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0755'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_cli
+  until: dl_cli is succeeded
+
+- name: "INSTALL | Set Confluent CLI ownership"
+  ansible.builtin.file:
+    path: /tmp/confluent
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+
+# ---------- Download and install Confluent Platform ----------
+
+- name: "INSTALL | Download Confluent Platform tarball from JFrog"
+  ansible.builtin.get_url:
+    url: "{{ jfrog_base_url }}/{{ jfrog_repo }}/confluent/{{ confluent_version }}/{{ confluent_version }}.tar"
+    dest: "{{ confluent_package_path }}"
+    url_username: "{{ jfrog_user }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: true
+    mode: '0644'
+    validate_certs: true
+  retries: "{{ download_retries }}"
+  delay: "{{ download_delay }}"
+  register: dl_confluent
+  until: dl_confluent is succeeded
+
+- name: "INSTALL | Create install directory {{ broker_install_dir }}"
+  ansible.builtin.file:
+    path: "{{ broker_install_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0755"
+
+- name: "INSTALL | Extract Confluent Platform tarball to /tmp"
+  ansible.builtin.unarchive:
+    src: "{{ confluent_package_path }}"
+    dest: /tmp/
+    remote_src: true
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+
+- name: "INSTALL | Find extracted Confluent directory under /tmp"
+  ansible.builtin.find:
+    paths: /tmp
+    patterns: "confluent*"
+    file_type: directory
+    recurse: false
+  register: confluent_dirs
+
+- name: "INSTALL | Fail if no confluent* directory found in /tmp"
+  ansible.builtin.fail:
+    msg: >-
+      No confluent* directory found in /tmp after extraction.
+      Check that {{ confluent_package_path }} is a valid Confluent Platform tar.
+  when: confluent_dirs.matched == 0
+
+- name: "INSTALL | Set extracted directory fact"
+  ansible.builtin.set_fact:
+    extracted_dir: "{{ (confluent_dirs.files | sort(attribute='path') | last)['path'] }}"
+  when: confluent_dirs.matched > 0
+
+- name: "INSTALL | Copy Confluent files to {{ broker_install_dir }}"
+  ansible.builtin.copy:
+    src: "{{ extracted_dir }}/"
+    dest: "{{ broker_install_dir }}/"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: preserve
+    remote_src: true
+
+- name: "INSTALL | Set ownership on {{ broker_install_dir }}"
+  ansible.builtin.file:
+    path: "{{ broker_install_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    recurse: true
+
+- name: "INSTALL | Verify kafka-server-start binary exists"
+  ansible.builtin.stat:
+    path: "{{ broker_install_dir }}/bin/kafka-server-start"
+  register: kafka_binary
+
+- name: "INSTALL | Fail if kafka-server-start binary not found"
+  ansible.builtin.fail:
+    msg: >-
+      kafka-server-start not found in {{ broker_install_dir }}/bin.
+      Verify the tar contains a valid Confluent Platform distribution.
+  when: not kafka_binary.stat.exists
+
+- name: "INSTALL | Confirm installation"
+  ansible.builtin.debug:
+    msg: "Confluent installed at {{ broker_install_dir }} (binary verified)"

@@ -1,0 +1,21 @@
+---
+# ==============================================================================
+# Configure systemd service for Kafka Broker
+#
+# The rendered unit file contains CONFLUENT_SECURITY_MASTER_KEY in the
+# Environment= line. no_log: true prevents the key appearing in AAP logs.
+# ==============================================================================
+
+- name: "SERVICE | Deploy confluent-kafka.service systemd unit"
+  ansible.builtin.template:
+    src: confluent-kafka.service.j2
+    dest: "/etc/systemd/system/{{ broker_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  no_log: true   # Environment= line contains CONFLUENT_SECURITY_MASTER_KEY
+  notify: reload systemd
+
+- name: "SERVICE | Reload systemd daemon"
+  ansible.builtin.systemd:
+    daemon_reload: true
