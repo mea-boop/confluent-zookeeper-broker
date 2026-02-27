@@ -45,25 +45,6 @@
   no_log: true
 
 # ------------------------------------------------------------------
-# Resolve broker_id from this host's position in broker_nodes group.
-# Index is 0-based; broker_id_base (default 1) sets the starting ID.
-# Example: broker_id_base=1 → broker IDs 1, 2, 3 ...
-#          broker_id_base=35 → broker IDs 35, 36, 37 ...
-# ------------------------------------------------------------------
-- name: "CONFIGURE | Resolve broker_id from broker_nodes group position"
-  ansible.builtin.set_fact:
-    broker_id: >-
-      {{
-        broker_id_base | int
-        + groups['broker_nodes'].index(inventory_hostname)
-      }}
-    cacheable: true
-
-- name: "CONFIGURE | Display broker identity"
-  ansible.builtin.debug:
-    msg: "Broker ID {{ broker_id }} → {{ ansible_fqdn }} (index {{ groups['broker_nodes'].index(inventory_hostname) }} in broker_nodes)"
-
-# ------------------------------------------------------------------
 # Pre-flight checks — validate both inventory groups are populated
 # ------------------------------------------------------------------
 - name: "CONFIGURE | Assert broker_nodes group is defined and non-empty"
@@ -91,7 +72,10 @@
     that:
       - hostvars[item]['ansible_fqdn'] is defined
       - hostvars[item]['ansible_fqdn'] != ''
-    fail_msg: "ansible_fqdn not resolved for broker node: {{ item }}"
+    fail_msg: >-
+      ansible_fqdn not resolved for broker node: {{ item }}.
+      Ensure the ZooKeeper fact-gather play ran first (Play 1 in deploy_broker.yml)
+      and that the host is reachable.
   loop: "{{ groups['broker_nodes'] }}"
   run_once: true
 
@@ -100,9 +84,64 @@
     that:
       - hostvars[item]['ansible_fqdn'] is defined
       - hostvars[item]['ansible_fqdn'] != ''
-    fail_msg: "ansible_fqdn not resolved for zookeeper node: {{ item }}"
+    fail_msg: >-
+      ansible_fqdn not resolved for zookeeper node: {{ item }}.
+      Ensure the ZooKeeper fact-gather play ran first (Play 1 in deploy_broker.yml)
+      and that the host is reachable.
   loop: "{{ groups['zookeeper_nodes'] }}"
   run_once: true
+
+# ------------------------------------------------------------------
+# Build cluster connection strings from live inventory groups.
+# Done here explicitly so template always has these facts, even when
+# configure.yml runs independently (not preceded by install_confluent.yml).
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Build bootstrap servers string from broker_nodes group"
+  ansible.builtin.set_fact:
+    bstring: >-
+      {{
+        groups['broker_nodes']
+        | map('extract', hostvars, 'ansible_fqdn')
+        | map('regex_replace', '$', ':' ~ kafka_sasl_ssl_port | string)
+        | join(',')
+      }}
+    cacheable: true
+
+- name: "CONFIGURE | Build ZooKeeper connect string from zookeeper_nodes group"
+  ansible.builtin.set_fact:
+    zookeeper_connect_dynamic: >-
+      {{
+        groups['zookeeper_nodes']
+        | map('extract', hostvars, 'ansible_fqdn')
+        | map('regex_replace', '$', ':2181')
+        | join(',')
+      }}
+    cacheable: true
+
+- name: "CONFIGURE | Display resolved connection strings"
+  ansible.builtin.debug:
+    msg:
+      - "Bootstrap servers : {{ bstring }}"
+      - "ZooKeeper connect : {{ zookeeper_connect_dynamic }}"
+  run_once: true
+
+# ------------------------------------------------------------------
+# Resolve broker_id from this host's position in broker_nodes group.
+# Index is 0-based; broker_id_base sets the starting ID.
+# Example: broker_id_base=35 → broker IDs 35, 36, 37 ...
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Resolve broker_id from broker_nodes group position"
+  ansible.builtin.set_fact:
+    broker_id: >-
+      {{
+        broker_id_base | int
+        + groups['broker_nodes'].index(inventory_hostname)
+      }}
+    cacheable: true
+
+- name: "CONFIGURE | Display broker identity"
+  ansible.builtin.debug:
+    msg: "Broker ID {{ broker_id }} → {{ ansible_fqdn }} (index {{ groups['broker_nodes'].index(inventory_hostname) }} in broker_nodes)"
 
 # ------------------------------------------------------------------
 # Ensure config directory exists
@@ -115,14 +154,69 @@
     group: "{{ broker_group }}"
     mode: "0755"
 
+# ------------------------------------------------------------------
+# Pre-template variable validation — runs WITHOUT no_log so any
+# undefined variable produces a visible, actionable error message
+# instead of a censored failure.
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Validate all template variables are defined"
+  ansible.builtin.assert:
+    that:
+      - broker_id                              is defined
+      - ansible_fqdn                           is defined
+      - kafka_sasl_ssl_port                    is defined
+      - kafka_token_port                       is defined
+      - kafka_ad_port                          is defined
+      - kafka_mds_port                         is defined
+      - broker_secrets_dir                     is defined
+      - ssl_truststore_location                is defined
+      - ssl_keystore_location                  is defined
+      - broker_rack                            is defined
+      - inter_broker_protocol_version          is defined
+      - broker_data_dir                        is defined
+      - bstring                                is defined
+      - bstring                                | length > 0
+      - zookeeper_connect_dynamic              is defined
+      - zookeeper_connect_dynamic              | length > 0
+      - zookeeper_connection_timeout_ms        is defined
+      - metrics_reporter_bootstrap_servers     is defined
+      - mds_public_key_path                    is defined
+      - mds_keypair_path                       is defined
+      - mds_token_max_lifetime_ms              is defined
+      - mds_token_signature_algorithm          is defined
+      - azure_tenant_id                        is defined
+      - azure_tenant_id                        != 'CHANGEME-azure-tenant-id'
+      - server_client_id                       is defined
+      - server_client_id                       != 'CHANGEME-server-client-id'
+      - oidc_client_id                         is defined
+      - oidc_client_id                         != 'CHANGEME-oidc-client-id'
+      - confluent_license                      is defined
+      - confluent_security_master_key          is defined
+      - audit_log_enable                       is defined
+      - audit_topic_allowed                    is defined
+      - audit_topic_denied                     is defined
+      - audit_topic_retention_ms               is defined
+      - audit_excluded_principals              is defined
+      - kafka_security_event_logger_topic_create is defined
+      - super_users                            is defined
+      - ldap_provider_url                      is defined
+      - ldap_principal                         is defined
+      - config_provider_class                  is defined
+    fail_msg: >-
+      One or more template variables are undefined or still set to CHANGEME
+      placeholder values. Check group_vars/all.yml and vault_secrets.yml.
+      Set no_log: false on the template task temporarily to see the full
+      Jinja2 error if this assertion passes but the template still fails.
+    success_msg: "All template variables validated — proceeding to deploy server.properties"
+
 # ==================================================================
 # DEPLOY server.properties directly from Jinja2 template.
 #
 # The template is the single source of truth — all section headings,
 # comments, and property ordering are preserved exactly as authored.
-# Secrets use ${securepass:...} placeholders so no plaintext values
-# are written into the file. no_log covers master.encryption.key
-# which is the only sensitive value rendered in plain text.
+# Secrets use ${securepass:...} placeholders so no plaintext passwords
+# appear in the file. The only exception is master.encryption.key
+# which SecurePass requires in plain text at JVM startup.
 # ==================================================================
 
 - name: "CONFIGURE | Back up existing server.properties before deploy"
@@ -134,7 +228,7 @@
     owner: "{{ broker_user }}"
     group: "{{ broker_group }}"
     mode: "0640"
-  failed_when: false   # skip silently if no existing file
+  failed_when: false   # skip silently on first run when no file exists yet
 
 - name: "CONFIGURE | Deploy server.properties from template"
   ansible.builtin.template:
@@ -145,9 +239,11 @@
     mode: "0640"
     backup: false
   no_log: true
-  # no_log: rendered file contains config.providers.securepass.param.master.encryption.key
-  # in plaintext. Temporarily set no_log: false to debug Jinja2 template errors,
-  # then restore to true before committing.
+  # no_log: TRUE — rendered file contains master.encryption.key in plain text.
+  # If this task fails with "censored" output, first run the validation task
+  # above — it will identify any undefined variable without no_log.
+  # Only if validation passes but template still fails: temporarily set
+  # no_log: false, re-run once to capture the Jinja2 error, then restore to true.
   notify: restart confluent-kafka
 
 # ------------------------------------------------------------------
