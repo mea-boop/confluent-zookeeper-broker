@@ -192,6 +192,10 @@
       - oidc_client_id                         != 'CHANGEME-oidc-client-id'
       - confluent_license                      is defined
       - confluent_security_master_key          is defined
+      - audit_log_bootstrap_servers              is defined
+      - audit_log_bootstrap_servers              | length > 0
+      - metrics_reporter_bootstrap_servers       is defined
+      - metrics_reporter_bootstrap_servers       | length > 0
       - audit_log_enable                       is defined
       - audit_topic_allowed                    is defined
       - audit_topic_denied                     is defined
@@ -240,10 +244,8 @@
     backup: false
   no_log: true
   # no_log: TRUE — rendered file contains master.encryption.key in plain text.
-  # If this task fails with "censored" output, first run the validation task
-  # above — it will identify any undefined variable without no_log.
-  # Only if validation passes but template still fails: temporarily set
-  # no_log: false, re-run once to capture the Jinja2 error, then restore to true.
+  # If this task fails with "censored" output, check the validation task above —
+  # it runs without no_log and will name the undefined variable explicitly.
   notify: restart confluent-kafka
 
 # ------------------------------------------------------------------
