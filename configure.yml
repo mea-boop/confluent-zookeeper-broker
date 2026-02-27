@@ -2,14 +2,16 @@
 # ==============================================================================
 # Configure Kafka Broker
 #
-# server.properties strategy: UPSERT (append new, update existing)
-#   - Template renders to /tmp staging file (uses ${securepass:...} placeholders)
-#   - Each key=value line is upserted into the live server.properties
-#   - Live file is never truncated - existing/manual properties preserved
-#   - New properties added to server.properties.j2 are appended automatically
+# server.properties strategy: FULL TEMPLATE REPLACE
+#   - Template is the single source of truth for structure, headings, and order
+#   - All section headings (# ---- Listeners ----, etc.) are preserved exactly
+#   - Secrets use ${securepass:...} placeholders — no plaintext in the file
+#   - Existing file is backed up to server.properties.bak before each deploy
+#   - master.encryption.key is the only sensitive value rendered in plain text;
+#     no_log: true on the template task prevents it appearing in AAP job logs
 #
 # broker_id strategy: derived from the host's 0-based index in the
-#   broker_nodes AAP inventory group + broker_id_base offset (default 1).
+#   broker_nodes AAP inventory group + broker_id_base offset.
 #   No broker_id_map needed — adding a new broker in AAP auto-assigns its ID.
 # ==============================================================================
 
@@ -114,90 +116,39 @@
     mode: "0755"
 
 # ==================================================================
-# UPSERT STRATEGY FOR server.properties
+# DEPLOY server.properties directly from Jinja2 template.
 #
-# Step 1: Render template → /tmp/server.properties.staged
-#         Staging file uses ${securepass:...} placeholders — no
-#         plaintext passwords. no_log covers master.encryption.key.
-#
-# Step 2: Slurp staged file, filter to key=value lines only
-#
-# Step 3: Extract key as everything before the FIRST '=' only
-#         (handles values that contain '=' e.g. jaas.config lines)
-#
-# Step 4: lineinfile upserts each key into the live file:
-#         - key exists → value updated in-place
-#         - key missing → line appended at end of file
-#
-# Step 5: Cleanup staging file
+# The template is the single source of truth — all section headings,
+# comments, and property ordering are preserved exactly as authored.
+# Secrets use ${securepass:...} placeholders so no plaintext values
+# are written into the file. no_log covers master.encryption.key
+# which is the only sensitive value rendered in plain text.
 # ==================================================================
 
-- name: "CONFIGURE | Render server.properties to staging file"
+- name: "CONFIGURE | Back up existing server.properties before deploy"
+  ansible.builtin.copy:
+    src: "{{ broker_config_dir }}/server.properties"
+    dest: "{{ broker_config_dir }}/server.properties.bak"
+    remote_src: true
+    force: true
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0640"
+  failed_when: false   # skip silently if no existing file
+
+- name: "CONFIGURE | Deploy server.properties from template"
   ansible.builtin.template:
     src: server.properties.j2
-    dest: /tmp/server.properties.staged
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
-    mode: "0640"
-  no_log: true
-  # no_log: staging file contains config.providers.securepass.param.master.encryption.key
-  # in plaintext. Temporarily set no_log: false to debug Jinja2 template errors,
-  # then restore to true before committing.
-
-- name: "CONFIGURE | Ensure live server.properties exists"
-  ansible.builtin.file:
-    path: "{{ broker_config_dir }}/server.properties"
-    state: touch
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
-    mode: "0640"
-    modification_time: preserve
-    access_time: preserve
-
-- name: "CONFIGURE | Slurp staged server.properties"
-  ansible.builtin.slurp:
-    src: /tmp/server.properties.staged
-  register: staged_raw
-
-- name: "CONFIGURE | Parse key=value lines from staged file"
-  ansible.builtin.set_fact:
-    staged_props: >-
-      {{
-        (staged_raw.content | b64decode).splitlines()
-        | select('match', '^[A-Za-z][A-Za-z0-9._-]+=')
-        | list
-      }}
-
-- name: "CONFIGURE | Extract property keys from staged lines"
-  ansible.builtin.set_fact:
-    staged_kv: >-
-      {{
-        staged_props | map('regex_replace', '^([^=]+)=.*$', '\1') | list
-      }}
-
-- name: "CONFIGURE | Upsert each property into live server.properties"
-  ansible.builtin.lineinfile:
-    path: "{{ broker_config_dir }}/server.properties"
-    regexp: "^{{ staged_kv[idx] | regex_escape }}="
-    line: "{{ item }}"
-    state: present
-    create: true
+    dest: "{{ broker_config_dir }}/server.properties"
     owner: "{{ broker_user }}"
     group: "{{ broker_group }}"
     mode: "0640"
     backup: false
-  loop: "{{ staged_props }}"
-  loop_control:
-    index_var: idx
-    label: "{{ staged_kv[idx] }}"
-  notify: restart confluent-kafka
   no_log: true
-  # no_log: loop iterates the master.encryption.key line in plaintext
-
-- name: "CONFIGURE | Remove staging file"
-  ansible.builtin.file:
-    path: /tmp/server.properties.staged
-    state: absent
+  # no_log: rendered file contains config.providers.securepass.param.master.encryption.key
+  # in plaintext. Temporarily set no_log: false to debug Jinja2 template errors,
+  # then restore to true before committing.
+  notify: restart confluent-kafka
 
 # ------------------------------------------------------------------
 # Deploy remaining config files (full replace — no secrets in these)
