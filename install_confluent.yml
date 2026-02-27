@@ -2,53 +2,72 @@
 # ==============================================================================
 # install_confluent.yml
 #
-# Builds /etc/hosts entries, constructs bootstrap/zookeeper connect strings,
-# downloads all Confluent artifacts from JFrog, and installs the platform.
+# Builds /etc/hosts entries and cluster connection strings dynamically from
+# AAP inventory groups (broker_nodes, zookeeper_nodes) — no hardcoded IPs.
+# Downloads all Confluent artifacts from JFrog and installs the platform.
+#
+# AAP inventory groups required:
+#   broker_nodes      — Kafka broker hosts
+#   zookeeper_nodes   — ZooKeeper hosts
+#
+# For each host Ansible resolves:
+#   ansible_host  → IP written into /etc/hosts
+#   inventory_hostname / ansible_fqdn → FQDN used in connect strings
 # ==============================================================================
 
-# ---------- /etc/hosts entries ----------
+# ---------- Build /etc/hosts from AAP inventory groups ----------
 
-- name: "INSTALL | Add Kafka broker entries to /etc/hosts"
+- name: "INSTALL | Add broker_nodes entries to /etc/hosts"
   ansible.builtin.lineinfile:
     path: /etc/hosts
-    line: "{{ item.1 | trim }} {{ kafka_short }}{{ item.0 + 1 }}-messaging-az.{{ domain_name }}"
-    regexp: "{{ kafka_short }}{{ item.0 + 1 }}-messaging-az\\.{{ domain_name }}"
+    line: "{{ hostvars[item]['ansible_host'] }} {{ hostvars[item]['ansible_fqdn'] }}"
+    regexp: "{{ hostvars[item]['ansible_fqdn'] | regex_escape }}"
     state: present
-  loop: "{{ kafka_broker_ips.split(',') | list | indexed }}"
+  loop: "{{ groups['broker_nodes'] }}"
   loop_control:
-    label: "broker{{ item.0 + 1 }}"
+    label: "{{ item }}"
+  run_once: false   # runs on every broker so each host gets all peers
 
-- name: "INSTALL | Add Zookeeper entries to /etc/hosts"
+- name: "INSTALL | Add zookeeper_nodes entries to /etc/hosts"
   ansible.builtin.lineinfile:
     path: /etc/hosts
-    line: "{{ item.1 | trim }} {{ zk_node_name }}{{ item.0 + 1 }}-messaging-az.{{ domain_name }}"
-    regexp: "{{ zk_node_name }}{{ item.0 + 1 }}-messaging-az\\.{{ domain_name }}"
+    line: "{{ hostvars[item]['ansible_host'] }} {{ hostvars[item]['ansible_fqdn'] }}"
+    regexp: "{{ hostvars[item]['ansible_fqdn'] | regex_escape }}"
     state: present
-  loop: "{{ zookeeper_ips.split(',') | list | indexed }}"
+  loop: "{{ groups['zookeeper_nodes'] }}"
   loop_control:
-    label: "zk{{ item.0 + 1 }}"
+    label: "{{ item }}"
 
-# ---------- Build cluster connection strings ----------
+# ---------- Build bootstrap + ZooKeeper connect strings from inventory ----------
 
-- name: "INSTALL | Build bootstrap servers string"
+- name: "INSTALL | Build bootstrap servers string from broker_nodes group"
   ansible.builtin.set_fact:
     bstring: >-
-      {%- set brokers = [] -%}
-      {%- for idx in range(kafka_broker_ips.split(',') | length) -%}
-        {%- set _ = brokers.append(kafka_short ~ (idx + 1) | string ~ '-messaging-az.' ~ domain_name ~ ':' ~ kafka_sasl_ssl_port | string) -%}
-      {%- endfor -%}
-      {{ brokers | join(',') }}
+      {{
+        groups['broker_nodes']
+        | map('extract', hostvars, 'ansible_fqdn')
+        | map('regex_replace', '$', ':' ~ kafka_sasl_ssl_port | string)
+        | join(',')
+      }}
     cacheable: true
 
-- name: "INSTALL | Build Zookeeper connect string"
+- name: "INSTALL | Build ZooKeeper connect string from zookeeper_nodes group"
   ansible.builtin.set_fact:
     zookeeper_connect_dynamic: >-
-      {%- set zks = [] -%}
-      {%- for idx in range(zookeeper_ips.split(',') | length) -%}
-        {%- set _ = zks.append(zk_node_name ~ (idx + 1) | string ~ '-messaging-az.' ~ domain_name ~ ':2181') -%}
-      {%- endfor -%}
-      {{ zks | join(',') }}
+      {{
+        groups['zookeeper_nodes']
+        | map('extract', hostvars, 'ansible_fqdn')
+        | map('regex_replace', '$', ':2181')
+        | join(',')
+      }}
     cacheable: true
+
+- name: "INSTALL | Display resolved connection strings"
+  ansible.builtin.debug:
+    msg:
+      - "Bootstrap servers : {{ bstring }}"
+      - "ZooKeeper connect : {{ zookeeper_connect_dynamic }}"
+  run_once: true
 
 # ---------- Download SSL certificates from JFrog ----------
 
@@ -65,6 +84,7 @@
   delay: "{{ download_delay }}"
   register: dl_truststore
   until: dl_truststore is succeeded
+  no_log: true
 
 - name: "INSTALL | Download server keystore ({{ ssl_keystore_filename }}) from JFrog"
   ansible.builtin.get_url:
@@ -79,6 +99,7 @@
   delay: "{{ download_delay }}"
   register: dl_cert
   until: dl_cert is succeeded
+  no_log: true
 
 - name: "INSTALL | Download chain root certificate from JFrog"
   ansible.builtin.get_url:
@@ -93,6 +114,7 @@
   delay: "{{ download_delay }}"
   register: dl_chain
   until: dl_chain is succeeded
+  no_log: true
 
 - name: "INSTALL | Download MDS keypair PEM from JFrog"
   ansible.builtin.get_url:
@@ -107,6 +129,7 @@
   delay: "{{ download_delay }}"
   register: dl_mdskey
   until: dl_mdskey is succeeded
+  no_log: true
 
 - name: "INSTALL | Download MDS public PEM from JFrog"
   ansible.builtin.get_url:
@@ -121,6 +144,7 @@
   delay: "{{ download_delay }}"
   register: dl_mdspub
   until: dl_mdspub is succeeded
+  no_log: true
 
 - name: "INSTALL | Set {{ ssl_dir }} ownership to {{ broker_user }}"
   ansible.builtin.file:
@@ -144,6 +168,7 @@
   delay: "{{ download_delay }}"
   register: dl_cli
   until: dl_cli is succeeded
+  no_log: true
 
 - name: "INSTALL | Set Confluent CLI ownership"
   ansible.builtin.file:
@@ -166,6 +191,7 @@
   delay: "{{ download_delay }}"
   register: dl_confluent
   until: dl_confluent is succeeded
+  no_log: true
 
 - name: "INSTALL | Create install directory {{ broker_install_dir }}"
   ansible.builtin.file:

@@ -3,14 +3,18 @@
 # Configure Kafka Broker
 #
 # server.properties strategy: UPSERT (append new, update existing)
-#   - Template renders to /tmp staging file (no secrets - uses ${securepass:...})
+#   - Template renders to /tmp staging file (uses ${securepass:...} placeholders)
 #   - Each key=value line is upserted into the live server.properties
 #   - Live file is never truncated - existing/manual properties preserved
 #   - New properties added to server.properties.j2 are appended automatically
+#
+# broker_id strategy: derived from the host's 0-based index in the
+#   broker_nodes AAP inventory group + broker_id_base offset (default 1).
+#   No broker_id_map needed — adding a new broker in AAP auto-assigns its ID.
 # ==============================================================================
 
 # ------------------------------------------------------------------
-# Load variables explicitly - guarantees they are available even if
+# Load variables explicitly — guarantees they are available even if
 # group_vars auto-load did not fire (AAP group name mismatch etc.)
 # ------------------------------------------------------------------
 - name: "CONFIGURE | Load group_vars/all.yml"
@@ -20,52 +24,82 @@
 - name: "CONFIGURE | Load and decrypt vault_secrets.yml"
   ansible.builtin.include_vars:
     file: "{{ playbook_dir }}/../group_vars/vault_secrets.yml"
-  no_log: true   # suppress only this task - vault file contains encrypted blobs
+  no_log: true
 
 # ------------------------------------------------------------------
-# Set plain-name variables from vault so templates can reference them directly
-# Note: confluent_license is NOT from vault - it is a plain var in all.yml
+# Map vault_ variables to plain names used by templates
 # ------------------------------------------------------------------
 - name: "CONFIGURE | Map vault_ variables to plain names"
   ansible.builtin.set_fact:
-    kafka_admin_password:    "{{ vault_kafka_admin_password }}"
-    ldap_bind_password:      "{{ vault_ldap_bind_password }}"
-    ssl_truststore_password: "{{ vault_ssl_truststore_password }}"
-    ssl_keystore_password:   "{{ vault_ssl_keystore_password }}"
+    kafka_admin_password:          "{{ vault_kafka_admin_password }}"
+    ldap_bind_password:            "{{ vault_ldap_bind_password }}"
+    ssl_truststore_password:       "{{ vault_ssl_truststore_password }}"
+    ssl_keystore_password:         "{{ vault_ssl_keystore_password }}"
     ssl_key_password:              "{{ vault_ssl_key_password }}"
     confluent_security_master_key: "{{ vault_confluent_security_master_key }}"
-  no_log: true   # suppress only this task - values are plaintext secrets
+    jfrog_user:                    "{{ vault_jfrog_user }}"
+    jfrog_password:                "{{ vault_jfrog_password }}"
+    oidc_client_secret:            "{{ vault_oidc_client_secret }}"
+  no_log: true
 
 # ------------------------------------------------------------------
-# Resolve broker_id from the FQDN→ID map
+# Resolve broker_id from this host's position in broker_nodes group.
+# Index is 0-based; broker_id_base (default 1) sets the starting ID.
+# Example: broker_id_base=1 → broker IDs 1, 2, 3 ...
+#          broker_id_base=35 → broker IDs 35, 36, 37 ...
 # ------------------------------------------------------------------
-- name: "CONFIGURE | Resolve broker_id for {{ inventory_hostname }}"
+- name: "CONFIGURE | Resolve broker_id from broker_nodes group position"
   ansible.builtin.set_fact:
-    broker_id: "{{ broker_id_map[inventory_hostname] }}"
+    broker_id: >-
+      {{
+        broker_id_base | int
+        + groups['broker_nodes'].index(inventory_hostname)
+      }}
     cacheable: true
 
 - name: "CONFIGURE | Display broker identity"
   ansible.builtin.debug:
-    msg: "Broker ID {{ broker_id }} → {{ ansible_fqdn }}"
+    msg: "Broker ID {{ broker_id }} → {{ ansible_fqdn }} (index {{ groups['broker_nodes'].index(inventory_hostname) }} in broker_nodes)"
 
 # ------------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight checks — validate both inventory groups are populated
 # ------------------------------------------------------------------
-- name: "CONFIGURE | Verify all broker FQDNs are defined"
+- name: "CONFIGURE | Assert broker_nodes group is defined and non-empty"
+  ansible.builtin.assert:
+    that:
+      - groups['broker_nodes'] is defined
+      - groups['broker_nodes'] | length > 0
+    fail_msg: >-
+      AAP inventory group 'broker_nodes' is missing or empty.
+      Create the group and add all Kafka broker hosts to it.
+  run_once: true
+
+- name: "CONFIGURE | Assert zookeeper_nodes group is defined and non-empty"
+  ansible.builtin.assert:
+    that:
+      - groups['zookeeper_nodes'] is defined
+      - groups['zookeeper_nodes'] | length > 0
+    fail_msg: >-
+      AAP inventory group 'zookeeper_nodes' is missing or empty.
+      Create the group and add all ZooKeeper hosts to it.
+  run_once: true
+
+- name: "CONFIGURE | Verify ansible_fqdn is set for all broker_nodes"
   ansible.builtin.assert:
     that:
       - hostvars[item]['ansible_fqdn'] is defined
       - hostvars[item]['ansible_fqdn'] != ''
-    fail_msg: "FQDN not found for {{ item }}"
-  loop: "{{ groups['all'] }}"
+    fail_msg: "ansible_fqdn not resolved for broker node: {{ item }}"
+  loop: "{{ groups['broker_nodes'] }}"
   run_once: true
 
-- name: "CONFIGURE | Verify all broker_id_map entries exist"
+- name: "CONFIGURE | Verify ansible_fqdn is set for all zookeeper_nodes"
   ansible.builtin.assert:
     that:
-      - broker_id_map[item] is defined
-    fail_msg: "broker_id_map entry missing for: {{ item }}"
-  loop: "{{ groups['all'] }}"
+      - hostvars[item]['ansible_fqdn'] is defined
+      - hostvars[item]['ansible_fqdn'] != ''
+    fail_msg: "ansible_fqdn not resolved for zookeeper node: {{ item }}"
+  loop: "{{ groups['zookeeper_nodes'] }}"
   run_once: true
 
 # ------------------------------------------------------------------
@@ -83,15 +117,13 @@
 # UPSERT STRATEGY FOR server.properties
 #
 # Step 1: Render template → /tmp/server.properties.staged
-#         NO no_log here - staging file uses ${securepass:...}
-#         placeholders, not plaintext secrets. Showing errors is
-#         essential for debugging Jinja2 template problems.
+#         Staging file uses ${securepass:...} placeholders — no
+#         plaintext passwords. no_log covers master.encryption.key.
 #
 # Step 2: Slurp staged file, filter to key=value lines only
 #
-# Step 3: For each line, extract the key as everything before the
-#         FIRST '=' only (handles values that contain '=' signs,
-#         e.g. jaas.config lines with password=...)
+# Step 3: Extract key as everything before the FIRST '=' only
+#         (handles values that contain '=' e.g. jaas.config lines)
 #
 # Step 4: lineinfile upserts each key into the live file:
 #         - key exists → value updated in-place
@@ -100,7 +132,7 @@
 # Step 5: Cleanup staging file
 # ==================================================================
 
-- name: "CONFIGURE | Render server.properties to staging file /tmp/server.properties.staged"
+- name: "CONFIGURE | Render server.properties to staging file"
   ansible.builtin.template:
     src: server.properties.j2
     dest: /tmp/server.properties.staged
@@ -108,9 +140,9 @@
     group: "{{ broker_group }}"
     mode: "0640"
   no_log: true
-  # no_log: staging file now contains config.providers.securepass.param.master.encryption.key
-  # in plaintext. If the template fails, temporarily set no_log: false to debug,
-  # then set it back to true before committing.
+  # no_log: staging file contains config.providers.securepass.param.master.encryption.key
+  # in plaintext. Temporarily set no_log: false to debug Jinja2 template errors,
+  # then restore to true before committing.
 
 - name: "CONFIGURE | Ensure live server.properties exists"
   ansible.builtin.file:
@@ -136,11 +168,6 @@
         | list
       }}
 
-# Build a list of dicts: [{key: ..., line: ...}, ...]
-# Key = everything before the FIRST '=' only.
-# This correctly handles lines like:
-#   sasl.jaas.config=Module required username="x" password=y;
-# where a naive split('=')[0] on the whole line would be wrong.
 - name: "CONFIGURE | Extract property keys from staged lines"
   ansible.builtin.set_fact:
     staged_kv: >-
@@ -173,7 +200,7 @@
     state: absent
 
 # ------------------------------------------------------------------
-# Deploy remaining config files (full replace - no secrets in these)
+# Deploy remaining config files (full replace — no secrets in these)
 # ------------------------------------------------------------------
 - name: "CONFIGURE | Deploy log4j.properties"
   ansible.builtin.template:

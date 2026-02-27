@@ -1,0 +1,80 @@
+---
+# ==============================================================================
+# Confluent Kafka Broker Deployment Playbook
+#
+# AAP Inventory Groups required:
+#   broker_nodes      — Kafka broker hosts (role runs here)
+#   zookeeper_nodes   — ZooKeeper hosts (facts gathered only, no tasks run)
+#
+# The first play gathers facts from zookeeper_nodes so that hostvars for those
+# hosts (ansible_fqdn, ansible_host) are available when broker tasks build the
+# ZooKeeper connect string and /etc/hosts entries.
+#
+# AAP Job Template requires TWO credentials:
+#   1. Machine credential  →  SSH + sudo access to ALL hosts (brokers + ZK)
+#   2. Vault credential    →  decrypts group_vars/vault_secrets.yml
+#
+# WHY explicit vars_files:
+#   AAP does not guarantee group_vars/<groupname>.yml loads unless the
+#   playbook hosts: value exactly matches the inventory group name.
+#   Explicit vars_files ensures every variable loads regardless of group naming.
+# ==============================================================================
+
+# ------------------------------------------------------------------
+# Play 1: Gather facts from ZooKeeper nodes only (no tasks run)
+# This populates hostvars[*]['ansible_fqdn'] and hostvars[*]['ansible_host']
+# for every zookeeper_nodes member so broker plays can reference them.
+# ------------------------------------------------------------------
+- name: Gather ZooKeeper node facts
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: true
+  tasks: []   # facts only — no tasks
+
+# ------------------------------------------------------------------
+# Play 2: Deploy Confluent Kafka Broker on all broker_nodes
+# ------------------------------------------------------------------
+- name: Deploy Confluent Kafka Broker Cluster
+  hosts: broker_nodes
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/all.yml"
+    - "{{ playbook_dir }}/../group_vars/vault_secrets.yml"
+
+  roles:
+    - broker
+
+  post_tasks:
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Kafka Broker Deployment Complete
+          ============================================
+          Broker nodes ({{ groups['broker_nodes'] | length }}):
+          {% for host in groups['broker_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }}
+            Broker ID : {{ hostvars[host]['broker_id'] | default('(resolved at configure step)') }}
+          {% endfor %}
+
+          ZooKeeper nodes ({{ groups['zookeeper_nodes'] | length }}):
+          {% for host in groups['zookeeper_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }}
+          {% endfor %}
+
+          Bootstrap servers : {{ bstring }}
+          ZooKeeper connect : {{ zookeeper_connect_dynamic }}
+
+          Secrets written to : {{ broker_secrets_dir }}/local-secrets.properties
+          Config deployed to : {{ broker_config_dir }}/server.properties
+          Service            : {{ broker_service_name }}
+          SASL_SSL Port      : {{ kafka_sasl_ssl_port }}
+          TOKEN Port         : {{ kafka_token_port }}
+          AD Port            : {{ kafka_ad_port }}
+          MDS Port           : {{ kafka_mds_port }}
+          Prometheus Port    : {{ prometheus_jmx_exporter_port }}
+          ============================================
+      run_once: true
