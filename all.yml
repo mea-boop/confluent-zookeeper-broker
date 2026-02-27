@@ -45,12 +45,13 @@ broker_secrets_dir: "/opt/secrets"
 ssl_dir: "/opt/ssl"
 
 # ------------------------------------------------------------------------------
-# Broker ID Map - keyed by FQDN, resolved per host at runtime from AAP inventory
+# Broker ID Base
+# broker_id is assigned at runtime as: broker_id_base + index_in_broker_nodes_group
+# The first host in the broker_nodes AAP group gets broker_id_base,
+# the second gets broker_id_base + 1, and so on.
+# Adjust broker_id_base so IDs do not collide with other clusters.
 # ------------------------------------------------------------------------------
-broker_id_map:
-  broker1-east-az3.prd.eeh.humana.com: 35
-  broker2-east-az3.prd.eeh.humana.com: 37
-  broker3-east-az3.prd.eeh.humana.com: 39
+broker_id_base: 35
 
 # ------------------------------------------------------------------------------
 # Broker Rack / AZ
@@ -58,11 +59,16 @@ broker_id_map:
 broker_rack: "eastus2-2"
 
 # ------------------------------------------------------------------------------
-# Fully Qualified Broker Hostnames
+# Cluster Connect Strings — built at runtime from AAP inventory groups
+#
+# bstring               : built in install_confluent.yml from groups['broker_nodes']
+# zookeeper_connect_dynamic : built in install_confluent.yml from groups['zookeeper_nodes']
+#
+# The static zookeeper_connect below is used ONLY as a fallback if the dynamic
+# fact was not set (e.g. running configure.yml in isolation). In normal AAP
+# deployments the dynamic value always takes precedence.
 # ------------------------------------------------------------------------------
-broker_bootstrap_fqdn: "broker-bootstrap-east-az3.prd.eeh.humana.com"
-zookeeper_bootstrap_fqdn: "zookeeper-bootstrap-east-az3.prd.eeh.humana.com"
-zookeeper_connect: "{{ zookeeper_bootstrap_fqdn }}:2181"
+zookeeper_connect: "DYNAMIC_FROM_INVENTORY_SEE_install_confluent.yml"
 zookeeper_connection_timeout_ms: 18000
 
 # ------------------------------------------------------------------------------
@@ -247,16 +253,6 @@ download_retries: 3
 download_delay: 10
 
 # ------------------------------------------------------------------------------
-# /etc/hosts builder inputs
-# Comma-separated lists of IPs; kafka_short / zk_node_name are short hostnames.
-# ------------------------------------------------------------------------------
-kafka_broker_ips: "10.0.0.1,10.0.0.2,10.0.0.3"
-kafka_short: "broker"
-zookeeper_ips: "10.0.1.1,10.0.1.2,10.0.1.3"
-zk_node_name: "zookeeper"
-domain_name: "prd.eeh.humana.com"
-
-# ------------------------------------------------------------------------------
 # SSL keystore filename (PFX/JKS file downloaded from JFrog)
 # ------------------------------------------------------------------------------
 ssl_keystore_filename: "_.prd.eeh.humana.com.pfx"
@@ -269,3 +265,14 @@ azure_tenant_id: "CHANGEME-azure-tenant-id"
 oidc_client_id: "CHANGEME-oidc-client-id"
 server_client_id: "CHANGEME-server-client-id"
 oidc_client_secret: "{{ vault_oidc_client_secret }}"
+
+# ------------------------------------------------------------------------------
+# /etc/hosts + bootstrap strings — derived at runtime from AAP inventory groups
+#
+# broker_nodes  : AAP inventory group containing the Kafka broker hosts
+# zookeeper_nodes: AAP inventory group containing the ZooKeeper hosts
+#
+# These variables are computed dynamically in install_confluent.yml using
+# groups['broker_nodes'] and groups['zookeeper_nodes'] from the live inventory.
+# No IPs or hostnames are hardcoded here.
+# ------------------------------------------------------------------------------
