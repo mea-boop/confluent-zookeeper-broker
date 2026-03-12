@@ -1,80 +1,162 @@
 ---
 # ==============================================================================
-# Confluent Kafka Broker Deployment Playbook
-#
-# AAP Inventory Groups required:
-#   broker_nodes      — Kafka broker hosts (role runs here)
-#   zookeeper_nodes   — ZooKeeper hosts (facts gathered only, no tasks run)
-#
-# The first play gathers facts from zookeeper_nodes so that hostvars for those
-# hosts (ansible_fqdn, ansible_host) are available when broker tasks build the
-# ZooKeeper connect string and /etc/hosts entries.
-#
-# AAP Job Template requires TWO credentials:
-#   1. Machine credential  →  SSH + sudo access to ALL hosts (brokers + ZK)
-#   2. Vault credential    →  decrypts group_vars/vault_secrets.yml
-#
-# WHY explicit vars_files:
-#   AAP does not guarantee group_vars/<groupname>.yml loads unless the
-#   playbook hosts: value exactly matches the inventory group name.
-#   Explicit vars_files ensures every variable loads regardless of group naming.
+# Configure Kafka Broker
 # ==============================================================================
-
+- name: "CONFIGURE | Load broker-vars.yml variables"
+  ansible.builtin.include_vars:
+    file: "../roles/vars/broker-vars.yml"
+- name: "CONFIGURE | Load secret variables"
+  ansible.builtin.include_vars:
+    file: "../roles/vars/secret.yml"
+  no_log: true
 # ------------------------------------------------------------------
-# Play 1: Gather facts from ZooKeeper nodes only (no tasks run)
-# This populates hostvars[*]['ansible_fqdn'] and hostvars[*]['ansible_host']
-# for every zookeeper_nodes member so broker plays can reference them.
+# Pre-flight checks — validate both inventory groups are populated
 # ------------------------------------------------------------------
-- name: Gather ZooKeeper node facts
-  hosts: zookeeper_nodes
-  become: true
-  gather_facts: true
-  tasks: []   # facts only — no tasks
-
+- name: "CONFIGURE | Assert broker_nodes group is defined and non-empty"
+  ansible.builtin.assert:
+    that:
+      - groups['broker_nodes'] is defined
+      - groups['broker_nodes'] | length > 0
+    fail_msg: >-
+      AAP inventory group 'broker_nodes' is missing or empty.
+      Create the group and add all Kafka broker hosts to it.
+  run_once: true
+- name: "CONFIGURE | Assert zookeeper_nodes group is defined and non-empty"
+  ansible.builtin.assert:
+    that:
+      - groups['zookeeper_nodes'] is defined
+      - groups['zookeeper_nodes'] | length > 0
+    fail_msg: >-
+      AAP inventory group 'zookeeper_nodes' is missing or empty.
+      Create the group and add all ZooKeeper hosts to it.
+  run_once: true
+- name: "CONFIGURE | Verify ansible_fqdn is set for all broker_nodes"
+  ansible.builtin.assert:
+    that:
+      - hostvars[item]['ansible_fqdn'] is defined
+      - hostvars[item]['ansible_fqdn'] != ''
+    fail_msg: >-
+      ansible_fqdn not resolved for broker node: {{ item }}.
+      Ensure the ZooKeeper fact-gather play ran first (Play 1 in deploy_broker.yml)
+      and that the host is reachable.
+  loop: "{{ groups['broker_nodes'] }}"
+  run_once: true
+- name: "CONFIGURE | Verify ansible_fqdn is set for all zookeeper_nodes"
+  ansible.builtin.assert:
+    that:
+      - hostvars[item]['ansible_fqdn'] is defined
+      - hostvars[item]['ansible_fqdn'] != ''
+    fail_msg: >-
+      ansible_fqdn not resolved for zookeeper node: {{ item }}.
+      Ensure the ZooKeeper fact-gather play ran first (Play 1 in deploy_broker.yml)
+      and that the host is reachable.
+  loop: "{{ groups['zookeeper_nodes'] }}"
+  run_once: true
 # ------------------------------------------------------------------
-# Play 2: Deploy Confluent Kafka Broker on all broker_nodes
+# Build cluster connection strings from live inventory groups.
+# Done here explicitly so template always has these facts, even when
+# configure.yml runs independently (not preceded by install_confluent.yml).
 # ------------------------------------------------------------------
-- name: Deploy Confluent Kafka Broker Cluster
-  hosts: broker_nodes
-  become: true
-  gather_facts: true
-  serial: 1
-
-  vars_files:
-    - "{{ playbook_dir }}/../group_vars/all.yml"
-    - "{{ playbook_dir }}/../group_vars/vault_secrets.yml"
-
-  roles:
-    - broker
-
-  post_tasks:
-    - name: Display deployment summary
-      ansible.builtin.debug:
-        msg: |
-          ============================================
-          Kafka Broker Deployment Complete
-          ============================================
-          Broker nodes ({{ groups['broker_nodes'] | length }}):
-          {% for host in groups['broker_nodes'] %}
-          - {{ hostvars[host]['ansible_fqdn'] }}
-            Broker ID : {{ hostvars[host]['broker_id'] | default('(resolved at configure step)') }}
-          {% endfor %}
-
-          ZooKeeper nodes ({{ groups['zookeeper_nodes'] | length }}):
-          {% for host in groups['zookeeper_nodes'] %}
-          - {{ hostvars[host]['ansible_fqdn'] }}
-          {% endfor %}
-
-          Bootstrap servers : {{ bstring }}
-          ZooKeeper connect : {{ zookeeper_connect_dynamic }}
-
-          Secrets written to : {{ broker_secrets_dir }}/local-secrets.properties
-          Config deployed to : {{ broker_config_dir }}/server.properties
-          Service            : {{ broker_service_name }}
-          SASL_SSL Port      : {{ kafka_sasl_ssl_port }}
-          TOKEN Port         : {{ kafka_token_port }}
-          AD Port            : {{ kafka_ad_port }}
-          MDS Port           : {{ kafka_mds_port }}
-          Prometheus Port    : {{ prometheus_jmx_exporter_port }}
-          ============================================
-      run_once: true
+- name: "CONFIGURE | Build bootstrap servers string from broker_nodes group"
+  ansible.builtin.set_fact:
+    bstring: >-
+      {{
+        groups['broker_nodes']
+        | map('extract', hostvars, 'ansible_fqdn')
+        | map('regex_replace', '$', ':' ~ kafka_sasl_ssl_port | string)
+        | join(',')
+      }}
+    cacheable: true
+- name: "CONFIGURE | Build ZooKeeper connect string from zookeeper_nodes group"
+  ansible.builtin.set_fact:
+    zookeeper_connect_dynamic: >-
+      {{
+        groups['zookeeper_nodes']
+        | map('extract', hostvars, 'ansible_fqdn')
+        | map('regex_replace', '$', ':2181')
+        | join(',')
+      }}
+    cacheable: true
+- name: "CONFIGURE | Display resolved connection strings"
+  ansible.builtin.debug:
+    msg:
+      - "Bootstrap servers : {{ bstring }}"
+      - "ZooKeeper connect : {{ zookeeper_connect_dynamic }}"
+  run_once: true
+# ------------------------------------------------------------------
+# Resolve broker_id from this host's position in broker_nodes group.
+# Index is 0-based; broker_id_base sets the starting ID.
+# Example: broker_id_base=35 → broker IDs 35, 36, 37 ...
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Resolve broker_id from broker_nodes group position"
+  ansible.builtin.set_fact:
+    broker_id: >-
+      {{
+        broker_id_base | int
+        + groups['broker_nodes'].index(inventory_hostname)
+      }}
+    cacheable: true
+- name: "CONFIGURE | Display broker identity"
+  ansible.builtin.debug:
+    msg: "Broker ID {{ broker_id }} → {{ ansible_fqdn }} (index {{ groups['broker_nodes'].index(inventory_hostname) }} in broker_nodes)"
+# ------------------------------------------------------------------
+# Ensure config directory exists
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Create broker config directory"
+  ansible.builtin.file:
+    path: "{{ broker_config_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0755"
+# ==================================================================
+# DEPLOY server.properties directly from Jinja2 template.
+#
+# The template is the single source of truth — all section headings,
+# comments, and property ordering are preserved exactly as authored.
+# Secrets use ${securepass:...} placeholders so no plaintext passwords
+# appear in the file. The only exception is master.encryption.key
+# which SecurePass requires in plain text at JVM startup.
+# ==================================================================
+- name: "CONFIGURE | Back up existing server.properties before deploy"
+  ansible.builtin.copy:
+    src: "{{ broker_config_dir }}/server.properties"
+    dest: "{{ broker_config_dir }}/server.properties.bak"
+    remote_src: true
+    force: true
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0640"
+  failed_when: false   # skip silently on first run when no file exists yet
+- name: "CONFIGURE | Deploy server.properties from template"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/server.properties.j2"
+    dest: "{{ broker_config_dir }}/server.properties"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0640"
+    backup: false
+  #no_log: true
+  # no_log: TRUE — rendered file contains master.encryption.key in plain text.
+  # If this task fails with "censored" output, check the validation task above —
+  # it runs without no_log and will name the undefined variable explicitly.
+  notify: restart confluent-kafka
+# ------------------------------------------------------------------
+# Deploy remaining config files (full replace — no secrets in these)
+# ------------------------------------------------------------------
+- name: "CONFIGURE | Deploy log4j.properties"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/log4j.properties.j2"
+    dest: "{{ broker_config_dir }}/log4j.properties"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0644"
+  notify: restart confluent-kafka
+- name: "CONFIGURE | Deploy broker-env.sh"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/broker-env.sh.j2"
+    dest: "{{ broker_install_dir }}/bin/broker-env.sh"
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0755"
+  notify: restart confluent-kafka
