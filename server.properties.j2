@@ -11,9 +11,7 @@ broker.id = {{ broker_id }}
 listeners = SASL_SSL://{{ ansible_fqdn }}:{{ kafka_sasl_ssl_port }},TOKEN://{{ ansible_fqdn }}:{{ kafka_token_port }},AD://{{ ansible_fqdn }}:{{ kafka_ad_port }}
 advertised.listeners = SASL_SSL://{{ ansible_fqdn }}:{{ kafka_sasl_ssl_port }},TOKEN://{{ ansible_fqdn }}:{{ kafka_token_port }},AD://{{ ansible_fqdn }}:{{ kafka_ad_port }}
 listener.security.protocol.map = SASL_SSL:SASL_SSL,TOKEN:SASL_SSL,AD:SASL_SSL
-listener.name.sasl_ssl.scram-sha-256.sasl.jaas.config = org.apache.kafka.common.security.scram.ScramLoginModule required \
-   username="admin" \
-   password=${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.sasl_ssl.scram-sha-256.sasl.jaas.config/org.apache.kafka.common.security.scram.ScramLoginModule/password};
+listener.name.sasl_ssl.scram-sha-256.sasl.jaas.config = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.sasl_ssl.scram-sha-256.sasl.jaas.config}
 
 # ---- Security ----
 sasl.enabled.mechanisms = SCRAM-SHA-256
@@ -73,49 +71,52 @@ confluent.metrics.reporter.sasl.jaas.config = org.apache.kafka.common.security.s
 
 # ---- TOKEN Listener (OAuth / MDS) ----
 listener.name.token.ssl.truststore.location = {{ ssl_truststore_location }}
-listener.name.token.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.token.ssl.truststore.password}
+listener.name.token.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.truststore.password}
 listener.name.token.ssl.keystore.location = {{ ssl_keystore_location }}
-listener.name.token.ssl.keystore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.token.ssl.keystore.password}
-listener.name.token.ssl.key.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.token.ssl.key.password}
+listener.name.token.ssl.keystore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.keystore.password}
+listener.name.token.ssl.key.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.key.password}
 listener.name.token.sasl.enabled.mechanisms = OAUTHBEARER
-listener.name.token.oauthbearer.sasl.jaas.config = org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required publicKeyPath="{{ mds_public_key_path }}";
+listener.name.token.oauthbearer.sasl.jaas.config = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.token.oauthbearer.sasl.jaas.config}
 listener.name.token.oauthbearer.sasl.server.callback.handler.class = io.confluent.kafka.server.plugins.auth.token.TokenBearerValidatorCallbackHandler
 listener.name.token.oauthbearer.sasl.login.callback.handler.class = io.confluent.kafka.server.plugins.auth.token.TokenBearerServerLoginCallbackHandler
 listener.name.token.principal.builder.class = io.confluent.kafka.security.authenticator.OAuthKafkaPrincipalBuilder
-listener.name.token.sasl.oauthbearer.jwks.endpoint.url = https://login.microsoftonline.com/{{ azure_tenant_id }}/discovery/v2.0/keys
-listener.name.token.sasl.oauthbearer.token.endpoint.url = https://login.microsoftonline.com/{{ azure_tenant_id }}/oauth2/v2.0/token
+listener.name.token.sasl.oauthbearer.jwks.endpoint.url = "https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/discovery/v2.0/keys"
+listener.name.token.sasl.oauthbearer.token.endpoint.url = "https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/oauth2/v2.0/token"
 listener.name.token.sasl.oauthbearer.scope.claim.name = roles
 listener.name.token.sasl.oauthbearer.sub.claim.name = sub
-listener.name.token.sasl.oauthbearer.expected.audience = {{ server_client_id }}
-listener.name.token.sasl.oauthbearer.expected.issuer = https://login.microsoftonline.com/{{ azure_tenant_id }}/v2.0
+listener.name.token.sasl.oauthbearer.expected.audience = {{ listener_name_token_sasl_oauthbearer_expected_audience }}
+listener.name.token.sasl.oauthbearer.expected.issuer = {{ listener_name_token_sasl_oauthbearer_expected_issuer }}
 
 # ---- OIDC / SSO ----
-confluent.oidc.idp.issuer = https://login.microsoftonline.com/{{ azure_tenant_id }}/v2.0
-confluent.oidc.idp.jwks.endpoint.uri = https://login.microsoftonline.com/{{ azure_tenant_id }}/discovery/v2.0/keys
-confluent.oidc.idp.authorize.base.endpoint.uri = https://login.microsoftonline.com/{{ azure_tenant_id }}/oauth2/v2.0/authorize
-confluent.oidc.idp.token.base.endpoint.uri = https://login.microsoftonline.com/{{ azure_tenant_id }}/oauth2/v2.0/token
-confluent.oidc.idp.client.id = {{ oidc_client_id }}
+# Configure OIDC for Login via SSO using OAuth
+confluent.oidc.idp.issuer=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/v2.0
+confluent.oidc.idp.jwks.endpoint.uri=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/discovery/v2.0/keys
+confluent.oidc.idp.authorize.base.endpoint.uri=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/oauth2/v2.0/authorize
+confluent.oidc.idp.token.base.endpoint.uri=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/oauth2/v2.0/token
+confluent.oidc.idp.client.id = {{ confluent_oidc_idp_client_id }}
 confluent.oidc.idp.client.secret = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.oidc.idp.client.secret}
-confluent.oidc.idp.device.authorization.endpoint.uri = https://login.microsoftonline.com/{{ azure_tenant_id }}/oauth2/v2.0/devicecode
-confluent.oidc.idp.refresh.token.enabled = true
-confluent.oidc.idp.groups.claim.name = groups
-confluent.oidc.idp.sub.claim.name = email
-confluent.metadata.server.sso.mode = oidc
-confluent.metadata.server.user.store = LDAP_WITH_OAUTH
-confluent.metadata.server.oauthbearer.jwks.endpoint.url = https://login.microsoftonline.com/{{ azure_tenant_id }}/discovery/v2.0/keys
-confluent.metadata.server.oauthbearer.expected.issuer = https://login.microsoftonline.com/{{ azure_tenant_id }}/v2.0
-confluent.metadata.server.oauthbearer.expected.audience = {{ server_client_id }}
-confluent.metadata.server.oauthbearer.sub.claim.name = sub
-confluent.metadata.server.oauthbearer.groups.claim.name = groups
+confluent.oidc.idp.device.authorization.endpoint.uri=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/oauth2/v2.0/devicecode
+confluent.oidc.idp.refresh.token.enabled=true
+confluent.oidc.idp.groups.claim.name=groups
+confluent.oidc.idp.sub.claim.name=email
+
+confluent.metadata.server.sso.mode=oidc
+confluent.metadata.server.user.store=LDAP_WITH_OAUTH
+
+confluent.metadata.server.oauthbearer.jwks.endpoint.url=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/discovery/v2.0/keys
+confluent.metadata.server.oauthbearer.expected.issuer=https://login.microsoftonline.com/56c62bbe-8598-4b85-9e51-1ca753fa50f2/v2.0
+confluent.metadata.server.oauthbearer.expected.audience = {{ confluent_metadata_server_oauthbearer_expected_audience }}
+confluent.metadata.server.oauthbearer.sub.claim.name=sub
+confluent.metadata.server.oauthbearer.groups.claim.name=groups
 
 # ---- MDS Service ----
 confluent.metadata.server.listeners = https://0.0.0.0:{{ kafka_mds_port }}
 confluent.metadata.server.advertised.listeners = https://{{ ansible_fqdn }}:{{ kafka_mds_port }}
 confluent.metadata.server.ssl.truststore.location = {{ ssl_truststore_location }}
-confluent.metadata.server.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.metadata.server.ssl.truststore.password}
+confluent.metadata.server.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.truststore.password}
 confluent.metadata.server.ssl.keystore.location = {{ ssl_keystore_location }}
-confluent.metadata.server.ssl.keystore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.metadata.server.ssl.keystore.password}
-confluent.metadata.server.ssl.key.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.metadata.server.ssl.key.password}
+confluent.metadata.server.ssl.keystore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.keystore.password}
+confluent.metadata.server.ssl.key.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.key.password}
 confluent.metadata.server.authentication.method = BEARER
 confluent.metadata.server.token.auth.enable = true
 confluent.metadata.server.token.max.lifetime.ms = {{ mds_token_max_lifetime_ms }}
@@ -125,9 +126,9 @@ confluent.metadata.server.public.key.path = {{ mds_public_key_path }}
 
 # ---- AD Listener (LDAP-backed PLAIN) ----
 listener.name.ad.ssl.truststore.location = {{ ssl_truststore_location }}
-listener.name.ad.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.ad.ssl.truststore.password}
+listener.name.ad.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.truststore.password}
 listener.name.ad.ssl.keystore.location = {{ ssl_keystore_location }}
-listener.name.ad.ssl.keystore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.ad.ssl.keystore.password}
+listener.name.ad.ssl.keystore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.keystore.password}
 listener.name.ad.ssl.key.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/listener.name.ad.ssl.key.password}
 listener.name.ad.sasl.enabled.mechanisms = PLAIN
 listener.name.ad.plain.sasl.jaas.config = org.apache.kafka.common.security.plain.PlainLoginModule required;
@@ -149,8 +150,8 @@ confluent.security.event.router.config = {{ router_config }}
 confluent.security.event.logger.exporter.kafka.sasl.mechanism = SCRAM-SHA-256
 confluent.security.event.logger.exporter.kafka.security.protocol = SASL_SSL
 confluent.security.event.logger.exporter.kafka.ssl.truststore.location = {{ ssl_truststore_location }}
-confluent.security.event.logger.exporter.kafka.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.security.event.logger.exporter.kafka.ssl.truststore.password}
-confluent.security.event.logger.exporter.kafka.sasl.jaas.config = org.apache.kafka.common.security.scram.ScramLoginModule required username='admin' password=${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.security.event.logger.exporter.kafka.sasl.jaas.config/org.apache.kafka.common.security.scram.ScramLoginModule/password};
+confluent.security.event.logger.exporter.kafka.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.truststore.password}
+confluent.security.event.logger.exporter.kafka.sasl.jaas.config = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/confluent.security.event.logger.exporter.kafka.sasl.jaas.config}
 
 # ---- Confluent Support ----
 confluent.support.metrics.enable = {{ confluent_support_metrics_enable }}
@@ -184,9 +185,9 @@ ldap.group.member.attribute.pattern = {{ ldap_group_member_attribute_pattern }}
 ldap.user.member.attribute.pattern = {{ ldap_user_member_attribute_pattern }}
 ldap.java.naming.security.protocol = SSL
 ldap.ssl.truststore.location = {{ ssl_truststore_location }}
-ldap.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ldap.ssl.truststore.password}
+ldap.ssl.truststore.password = ${securepass:{{ broker_secrets_dir }}/local-secrets.properties:server.properties/ssl.truststore.password}
 
 # ---- Secure Pass Config Provider ----
 config.providers = securepass
 config.providers.securepass.class = {{ config_provider_class }}
-config.providers.securepass.param.master.encryption.key = {{ confluent_security_master_key }}
+config.providers.securepass.param.master.encryption.key = {{ CONFLUENT_SECURITY_MASTER_KEY }}
