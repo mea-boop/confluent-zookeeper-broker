@@ -1,162 +1,37 @@
 ---
-# ==============================================================================
-# Configure Kafka Broker
-# ==============================================================================
-- name: "CONFIGURE | Load broker-vars.yml variables"
-  ansible.builtin.include_vars:
-    file: "../roles/vars/broker-vars.yml"
-- name: "CONFIGURE | Load secret variables"
-  ansible.builtin.include_vars:
-    file: "../roles/vars/secret.yml"
-  no_log: true
-# ------------------------------------------------------------------
-# Pre-flight checks — validate both inventory groups are populated
-# ------------------------------------------------------------------
-- name: "CONFIGURE | Assert broker_nodes group is defined and non-empty"
-  ansible.builtin.assert:
-    that:
-      - groups['broker_nodes'] is defined
-      - groups['broker_nodes'] | length > 0
-    fail_msg: >-
-      AAP inventory group 'broker_nodes' is missing or empty.
-      Create the group and add all Kafka broker hosts to it.
-  run_once: true
-- name: "CONFIGURE | Assert zookeeper_nodes group is defined and non-empty"
-  ansible.builtin.assert:
-    that:
-      - groups['zookeeper_nodes'] is defined
-      - groups['zookeeper_nodes'] | length > 0
-    fail_msg: >-
-      AAP inventory group 'zookeeper_nodes' is missing or empty.
-      Create the group and add all ZooKeeper hosts to it.
-  run_once: true
-- name: "CONFIGURE | Verify ansible_fqdn is set for all broker_nodes"
-  ansible.builtin.assert:
-    that:
-      - hostvars[item]['ansible_fqdn'] is defined
-      - hostvars[item]['ansible_fqdn'] != ''
-    fail_msg: >-
-      ansible_fqdn not resolved for broker node: {{ item }}.
-      Ensure the ZooKeeper fact-gather play ran first (Play 1 in deploy_broker.yml)
-      and that the host is reachable.
-  loop: "{{ groups['broker_nodes'] }}"
-  run_once: true
-- name: "CONFIGURE | Verify ansible_fqdn is set for all zookeeper_nodes"
-  ansible.builtin.assert:
-    that:
-      - hostvars[item]['ansible_fqdn'] is defined
-      - hostvars[item]['ansible_fqdn'] != ''
-    fail_msg: >-
-      ansible_fqdn not resolved for zookeeper node: {{ item }}.
-      Ensure the ZooKeeper fact-gather play ran first (Play 1 in deploy_broker.yml)
-      and that the host is reachable.
-  loop: "{{ groups['zookeeper_nodes'] }}"
-  run_once: true
-# ------------------------------------------------------------------
-# Build cluster connection strings from live inventory groups.
-# Done here explicitly so template always has these facts, even when
-# configure.yml runs independently (not preceded by install_confluent.yml).
-# ------------------------------------------------------------------
-- name: "CONFIGURE | Build bootstrap servers string from broker_nodes group"
-  ansible.builtin.set_fact:
-    bstring: >-
-      {{
-        groups['broker_nodes']
-        | map('extract', hostvars, 'ansible_fqdn')
-        | map('regex_replace', '$', ':' ~ kafka_sasl_ssl_port | string)
-        | join(',')
-      }}
-    cacheable: true
-- name: "CONFIGURE | Build ZooKeeper connect string from zookeeper_nodes group"
-  ansible.builtin.set_fact:
-    zookeeper_connect_dynamic: >-
-      {{
-        groups['zookeeper_nodes']
-        | map('extract', hostvars, 'ansible_fqdn')
-        | map('regex_replace', '$', ':2181')
-        | join(',')
-      }}
-    cacheable: true
-- name: "CONFIGURE | Display resolved connection strings"
-  ansible.builtin.debug:
-    msg:
-      - "Bootstrap servers : {{ bstring }}"
-      - "ZooKeeper connect : {{ zookeeper_connect_dynamic }}"
-  run_once: true
-# ------------------------------------------------------------------
-# Resolve broker_id from this host's position in broker_nodes group.
-# Index is 0-based; broker_id_base sets the starting ID.
-# Example: broker_id_base=35 → broker IDs 35, 36, 37 ...
-# ------------------------------------------------------------------
-- name: "CONFIGURE | Resolve broker_id from broker_nodes group position"
-  ansible.builtin.set_fact:
-    broker_id: >-
-      {{
-        broker_id_base | int
-        + groups['broker_nodes'].index(inventory_hostname)
-      }}
-    cacheable: true
-- name: "CONFIGURE | Display broker identity"
-  ansible.builtin.debug:
-    msg: "Broker ID {{ broker_id }} → {{ ansible_fqdn }} (index {{ groups['broker_nodes'].index(inventory_hostname) }} in broker_nodes)"
-# ------------------------------------------------------------------
-# Ensure config directory exists
-# ------------------------------------------------------------------
-- name: "CONFIGURE | Create broker config directory"
-  ansible.builtin.file:
-    path: "{{ broker_config_dir }}"
-    state: directory
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
-    mode: "0755"
-# ==================================================================
-# DEPLOY server.properties directly from Jinja2 template.
-#
-# The template is the single source of truth — all section headings,
-# comments, and property ordering are preserved exactly as authored.
-# Secrets use ${securepass:...} placeholders so no plaintext passwords
-# appear in the file. The only exception is master.encryption.key
-# which SecurePass requires in plain text at JVM startup.
-# ==================================================================
-- name: "CONFIGURE | Back up existing server.properties before deploy"
+# Called by deploy_secrets.yml for each secret property.
+# Copies the original seed file fresh before each encrypt call so the CLI
+# always sees full plaintext regardless of rewrites from prior iterations.
+
+- name: "SECRETS | Copy fresh seed file for {{ secret_item }}"
   ansible.builtin.copy:
-    src: "{{ broker_config_dir }}/server.properties"
-    dest: "{{ broker_config_dir }}/server.properties.bak"
+    src: "{{ secrets_tmpdir.path }}/server.properties"
+    dest: "{{ secrets_tmpdir.path }}/server_orig.properties"
     remote_src: true
-    force: true
     owner: "{{ broker_user }}"
     group: "{{ broker_group }}"
-    mode: "0640"
-  failed_when: false   # skip silently on first run when no file exists yet
-- name: "CONFIGURE | Deploy server.properties from template"
-  ansible.builtin.template:
-    src: "{{ role_path }}/templates/server.properties.j2"
-    dest: "{{ broker_config_dir }}/server.properties"
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
-    mode: "0640"
-    backup: false
-  #no_log: true
-  # no_log: TRUE — rendered file contains master.encryption.key in plain text.
-  # If this task fails with "censored" output, check the validation task above —
-  # it runs without no_log and will name the undefined variable explicitly.
-  notify: restart confluent-kafka
-# ------------------------------------------------------------------
-# Deploy remaining config files (full replace — no secrets in these)
-# ------------------------------------------------------------------
-- name: "CONFIGURE | Deploy log4j.properties"
-  ansible.builtin.template:
-    src: "{{ role_path }}/templates/log4j.properties.j2"
-    dest: "{{ broker_config_dir }}/log4j.properties"
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
-    mode: "0644"
-  notify: restart confluent-kafka
-- name: "CONFIGURE | Deploy broker-env.sh"
-  ansible.builtin.template:
-    src: "{{ role_path }}/templates/broker-env.sh.j2"
-    dest: "{{ broker_install_dir }}/bin/broker-env.sh"
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
-    mode: "0755"
-  notify: restart confluent-kafka
+    mode: "0600"
+  no_log: true
+
+- name: "SECRETS | Encrypt {{ secret_item }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ broker_install_dir }}/bin/confluent"
+      - "secret"
+      - "file"
+      - "encrypt"
+      - "--config-file"
+      - "{{ secrets_tmpdir.path }}/server_orig.properties"
+      - "--local-secrets-file"
+      - "{{ broker_secrets_dir }}/local-secrets.properties"
+      - "--remote-secrets-file"
+      - "{{ broker_secrets_dir }}/local-secrets.properties"
+      - "--config"
+      - "{{ secret_item }}"
+  environment:
+    CONFLUENT_SECURITY_MASTER_KEY: "{{ CONFLUENT_SECURITY_MASTER_KEY }}"
+  become: true
+  become_user: "{{ broker_user }}"
+  register: encrypt_result
+  failed_when: encrypt_result.rc != 0
+  changed_when: true
