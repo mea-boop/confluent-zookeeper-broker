@@ -1,0 +1,32 @@
+---
+# ==============================================================================
+# Start Control Center and wait for REST port
+# ==============================================================================
+
+- name: "START | Start confluent-control-center"
+  ansible.builtin.systemd:
+    name: "{{ c3_service_name }}"
+    state: started
+    daemon_reload: true
+
+- name: "START | Wait for REST port {{ c3_rest_port }} to open"
+  ansible.builtin.wait_for:
+    host: "{{ ansible_fqdn }}"
+    port: "{{ c3_rest_port }}"
+    state: started
+    delay: 10
+    timeout: 300
+
+- name: "START | Set final ownership"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    recurse: true
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+  loop:
+    - "{{ c3_install_dir }}"
+    - "{{ c3_data_dir }}"
+    - "{{ c3_log_dir }}"
+    - "{{ c3_ssl_dir }}"
+    - "{{ c3_secrets_dir }}"

@@ -1,0 +1,36 @@
+---
+# Sub-task called by deploy_secrets.yml per property.
+# Copies fresh seed file each iteration so CLI always sees full plaintext.
+
+- name: "SECRETS | Copy fresh seed file for {{ c3_secret_item }}"
+  ansible.builtin.copy:
+    src: "{{ c3_secrets_tmpdir.path }}/control-center.properties"
+    dest: "{{ c3_secrets_tmpdir.path }}/control-center-orig.properties"
+    remote_src: true
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+    mode: "0600"
+  no_log: true
+
+- name: "SECRETS | Encrypt {{ c3_secret_item }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ c3_install_dir }}/bin/confluent"
+      - "secret"
+      - "file"
+      - "encrypt"
+      - "--config-file"
+      - "{{ c3_secrets_tmpdir.path }}/control-center-orig.properties"
+      - "--local-secrets-file"
+      - "{{ c3_secrets_dir }}/local-secrets.properties"
+      - "--remote-secrets-file"
+      - "{{ c3_secrets_dir }}/local-secrets.properties"
+      - "--config"
+      - "{{ c3_secret_item }}"
+  environment:
+    CONFLUENT_SECURITY_MASTER_KEY: "{{ CONFLUENT_SECURITY_MASTER_KEY }}"
+  become: true
+  become_user: "{{ c3_user }}"
+  register: c3_encrypt_result
+  failed_when: c3_encrypt_result.rc != 0
+  changed_when: true

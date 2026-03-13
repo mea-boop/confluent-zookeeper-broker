@@ -1,0 +1,46 @@
+---
+# ==============================================================================
+# Write control-center.properties from template
+# ==============================================================================
+
+- name: "CONFIG | Load secret variables"
+  ansible.builtin.include_vars:
+    file: "../roles/vars/c3-secret.yml"
+  no_log: true
+
+- name: "CONFIG | Backup existing config if present"
+  ansible.builtin.copy:
+    src: "{{ c3_config_dir }}/{{ c3_config_file }}"
+    dest: "{{ c3_config_dir }}/{{ c3_config_file }}.bak"
+    remote_src: true
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+  failed_when: false
+
+- name: "CONFIG | Write control-center.properties"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/control-center.properties.j2"
+    dest: "{{ c3_config_dir }}/{{ c3_config_file }}"
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+    mode: "0640"
+  no_log: true
+
+- name: "CONFIG | Copy config to /etc/confluent-control-center"
+  ansible.builtin.copy:
+    src: "{{ c3_config_dir }}/{{ c3_config_file }}"
+    dest: "/etc/confluent-control-center/{{ c3_config_file }}"
+    remote_src: true
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+    mode: "0640"
+
+- name: "CONFIG | Download log4j config from Artifactory"
+  ansible.builtin.get_url:
+    url: "{{ c3_artifactory_base_url }}/{{ c3_artifactory_repo }}/confluent/log4j/control-center-log4j.properties"
+    dest: "{{ c3_config_dir }}/log4j-rolling.properties"
+    url_username: "{{ artifactory_user }}"
+    url_password: "{{ artifactory_password }}"
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+    mode: "0644"

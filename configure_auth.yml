@@ -1,0 +1,20 @@
+---
+# ==============================================================================
+# Configure JAAS login module and login.properties for C3 UI authentication
+# ==============================================================================
+
+- name: "AUTH | Write login.properties"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/login.properties.j2"
+    dest: "{{ c3_ssl_login_properties }}"
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+    mode: "0640"
+
+- name: "AUTH | Write propertyfile.jaas"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/propertyfile.jaas.j2"
+    dest: "{{ c3_ssl_jaas_file }}"
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
+    mode: "0640"

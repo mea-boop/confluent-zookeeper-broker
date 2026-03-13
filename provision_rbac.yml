@@ -1,0 +1,73 @@
+---
+# ==============================================================================
+# Provision RBAC role bindings for Control Center service account via MDS
+# ==============================================================================
+
+- name: "RBAC | Load secret variables"
+  ansible.builtin.include_vars:
+    file: "../roles/vars/c3-secret.yml"
+  no_log: true
+
+- name: "RBAC | Wait for MDS to be available"
+  ansible.builtin.uri:
+    url: "{{ c3_mds_url }}/security/1.0/metadataClusterId"
+    method: GET
+    url_username: "{{ kafka_service_user }}"
+    url_password: "{{ kafka_service_password }}"
+    ca_path: "{{ c3_ssl_truststore_location }}"
+    status_code: 200
+    timeout: 30
+  register: mds_check
+  until: mds_check.status == 200
+  retries: 30
+  delay: 10
+
+- name: "RBAC | Get Kafka cluster ID from MDS"
+  ansible.builtin.set_fact:
+    kafka_cluster_id: "{{ mds_check.json }}"
+
+- name: "RBAC | Login to Confluent CLI"
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/confluent
+      - login
+      - "--url={{ c3_mds_url }}"
+  environment:
+    CONFLUENT_PLATFORM_USERNAME: "{{ kafka_service_user }}"
+    CONFLUENT_PLATFORM_PASSWORD: "{{ kafka_service_password }}"
+  changed_when: true
+  no_log: true
+
+- name: "RBAC | Grant SystemAdmin on Kafka cluster"
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/confluent
+      - iam
+      - rbac
+      - role-binding
+      - create
+      - "--principal"
+      - "User:{{ c3_service_user }}"
+      - "--role"
+      - SystemAdmin
+      - "--kafka-cluster"
+      - "{{ kafka_cluster_id }}"
+  changed_when: true
+
+- name: "RBAC | Grant SystemAdmin on Connect cluster"
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/confluent
+      - iam
+      - rbac
+      - role-binding
+      - create
+      - "--principal"
+      - "User:{{ c3_service_user }}"
+      - "--role"
+      - SystemAdmin
+      - "--kafka-cluster"
+      - "{{ kafka_cluster_id }}"
+      - "--connect-cluster"
+      - "{{ c3_connect_cluster_name }}"
+  changed_when: true
