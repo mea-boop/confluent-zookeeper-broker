@@ -1,40 +1,18 @@
 ---
-# ==============================================================================
-# Confluent Control Center — Main task orchestration
-# ==============================================================================
+# Defaults — override in c3-vars.yml or inventory
+c3_user: confluent
+c3_group: confluent
+c3_rest_port: 9022
+c3_jmx_port: 9000
+c3_node_exporter_port: 8087
+c3_heap_opts: "-Xmx20g"
 
-- name: OS tuning
-  ansible.builtin.include_tasks: os_tune.yml
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
 
-- name: Create user and directories
-  ansible.builtin.include_tasks: create_directories.yml
-
-- name: Install Java
-  ansible.builtin.include_tasks: install_java.yml
-
-- name: Install Confluent Control Center
-  ansible.builtin.include_tasks: install_confluent.yml
-
-- name: Install observability agents
-  ansible.builtin.include_tasks: setup_observability.yml
-
-- name: Configure Control Center
-  ansible.builtin.include_tasks: configure.yml
-
-- name: Deploy and encrypt secrets
-  ansible.builtin.include_tasks: deploy_secrets.yml
-
-- name: Configure JAAS and login properties
-  ansible.builtin.include_tasks: configure_auth.yml
-
-- name: Configure systemd service
-  ansible.builtin.include_tasks: configure_service.yml
-
-- name: Provision RBAC role bindings
-  ansible.builtin.include_tasks: provision_rbac.yml
-
-- name: Start Control Center
-  ansible.builtin.include_tasks: start_service.yml
-
-- name: Validate Control Center
-  ansible.builtin.include_tasks: validate.yml
+- name: disable thp now
+  ansible.builtin.shell:
+    cmd: echo never > /sys/kernel/mm/transparent_hugepage/enabled
+  changed_when: true
