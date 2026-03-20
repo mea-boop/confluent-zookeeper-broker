@@ -13,6 +13,7 @@
     owner: "{{ broker_user }}"
     group: "{{ broker_group }}"
     mode: "0600"
+    force: true
   no_log: true
 
 - name: "SECRETS | Encrypt {{ secret_item }}"
