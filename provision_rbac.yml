@@ -39,15 +39,14 @@
         owner: "{{ broker_user }}"
         group: "{{ broker_group }}"
         mode: "0600"
+        force: true
       no_log: true
 
-    # awk skips blank lines and comment lines (#), splits on first =,
-    # prints only the key (field 1) with whitespace stripped.
     - name: "SECRETS | Extract property keys from seed file"
       ansible.builtin.command:
         argv:
           - awk
-          - "!/^[[:space:]]*(#|$)/ && /=/ { n=index($0,\"=\"); k=substr($0,1,n-1); gsub(/[[:space:]]/,\"\",k); print k }"
+          - '!/^[[:space:]]*(#|$)/ && /=/ { n=index($0,"="); k=substr($0,1,n-1); gsub(/[[:space:]]/,"",k); print k }'
           - "{{ secrets_tmpdir.path }}/seed-master.properties"
       register: seed_keys_raw
       changed_when: false
