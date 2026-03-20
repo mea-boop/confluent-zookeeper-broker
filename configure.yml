@@ -1,46 +1,39 @@
 ---
-# ==============================================================================
-# Write control-center.properties from template
-# ==============================================================================
+# Called by deploy_secrets.yml for each secret property.
+# The master seed file is kept as "seed-master.properties".
+# Before each encrypt call we copy it to "server.properties" so the CLI
+# uses "server.properties" as the key prefix in local-secrets —
+# matching the ${securepass:...} refs in the real server.properties.
 
-- name: "CONFIG | Load secret variables"
-  ansible.builtin.include_vars:
-    file: "../roles/vars/c3-secret.yml"
+- name: "SECRETS | Copy fresh seed file for {{ secret_item }}"
+  ansible.builtin.copy:
+    src: "{{ secrets_tmpdir.path }}/seed-master.properties"
+    dest: "{{ secrets_tmpdir.path }}/server.properties"
+    remote_src: true
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0600"
   no_log: true
 
-- name: "CONFIG | Backup existing config if present"
-  ansible.builtin.copy:
-    src: "{{ c3_config_dir }}/{{ c3_config_file }}"
-    dest: "{{ c3_config_dir }}/{{ c3_config_file }}.bak"
-    remote_src: true
-    owner: "{{ c3_user }}"
-    group: "{{ c3_group }}"
-  failed_when: false
-
-- name: "CONFIG | Write control-center.properties"
-  ansible.builtin.template:
-    src: "{{ role_path }}/templates/control-center.properties.j2"
-    dest: "{{ c3_config_dir }}/{{ c3_config_file }}"
-    owner: "{{ c3_user }}"
-    group: "{{ c3_group }}"
-    mode: "0640"
-  no_log: true
-
-- name: "CONFIG | Copy config to /etc/confluent-control-center"
-  ansible.builtin.copy:
-    src: "{{ c3_config_dir }}/{{ c3_config_file }}"
-    dest: "/etc/confluent-control-center/{{ c3_config_file }}"
-    remote_src: true
-    owner: "{{ c3_user }}"
-    group: "{{ c3_group }}"
-    mode: "0640"
-
-- name: "CONFIG | Download log4j config from Artifactory"
-  ansible.builtin.get_url:
-    url: "{{ c3_artifactory_base_url }}/{{ c3_artifactory_repo }}/confluent/log4j/control-center-log4j.properties"
-    dest: "{{ c3_config_dir }}/log4j-rolling.properties"
-    url_username: "{{ artifactory_user }}"
-    url_password: "{{ artifactory_password }}"
-    owner: "{{ c3_user }}"
-    group: "{{ c3_group }}"
-    mode: "0644"
+- name: "SECRETS | Encrypt {{ secret_item }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ broker_install_dir }}/bin/confluent"
+      - "secret"
+      - "file"
+      - "encrypt"
+      - "--config-file"
+      - "{{ secrets_tmpdir.path }}/server.properties"
+      - "--local-secrets-file"
+      - "{{ broker_secrets_dir }}/local-secrets.properties"
+      - "--remote-secrets-file"
+      - "{{ broker_secrets_dir }}/local-secrets.properties"
+      - "--config"
+      - "{{ secret_item }}"
+  environment:
+    CONFLUENT_SECURITY_MASTER_KEY: "{{ CONFLUENT_SECURITY_MASTER_KEY }}"
+  become: true
+  become_user: "{{ broker_user }}"
+  register: encrypt_result
+  failed_when: encrypt_result.rc != 0
+  changed_when: true
