@@ -8,11 +8,6 @@
 #   That is all — the key list and assertion are fully dynamic.
 # ==============================================================================
 
-- name: "SECRETS | Load secret variables"
-  ansible.builtin.include_vars:
-    file: "../roles/vars/secret.yml"
-  no_log: true
-
 - name: "SECRETS | Ensure {{ broker_secrets_dir }} exists"
   ansible.builtin.file:
     path: "{{ broker_secrets_dir }}"
@@ -60,6 +55,27 @@
     - name: "SECRETS | Show properties to encrypt ({{ secret_properties | length }} total)"
       ansible.builtin.debug:
         msg: "Will encrypt {{ secret_properties | length }} properties: {{ secret_properties }}"
+
+    # Rotate up to 5 backups before recreating — no manual deletion needed
+    - name: "SECRETS | Rotate local-secrets.properties backups (keep 5)"
+      ansible.builtin.shell:
+        cmd: |
+          f="{{ broker_secrets_dir }}/local-secrets.properties"
+          if [ -f "$f" ]; then
+            for i in 4 3 2 1; do
+              [ -f "${f}.${i}" ] && mv "${f}.${i}" "${f}.$((i+1))"
+            done
+            cp "$f" "${f}.1"
+          fi
+      changed_when: true
+      become: true
+      become_user: "{{ broker_user }}"
+      failed_when: false
+
+    - name: "SECRETS | Remove existing local-secrets.properties to force clean recreate"
+      ansible.builtin.file:
+        path: "{{ broker_secrets_dir }}/local-secrets.properties"
+        state: absent
 
     - name: "SECRETS | Initialise empty local-secrets.properties"
       ansible.builtin.file:
