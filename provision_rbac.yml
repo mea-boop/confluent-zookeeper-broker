@@ -1,73 +1,124 @@
 ---
 # ==============================================================================
-# Provision RBAC role bindings for Control Center service account via MDS
+# Deploy and encrypt Confluent SecurePass secrets
+#
+# To add a new secret:
+#   1. Add the value to roles/vars/secret.yml (vault encrypted)
+#   2. Add the key = {{ variable }} line to secrets-seed.properties.j2
+#   That is all — the key list and assertion are fully dynamic.
 # ==============================================================================
 
-- name: "RBAC | Load secret variables"
+- name: "SECRETS | Load secret variables"
   ansible.builtin.include_vars:
-    file: "../roles/vars/c3-secret.yml"
+    file: "../roles/vars/secret.yml"
   no_log: true
 
-- name: "RBAC | Wait for MDS to be available"
-  ansible.builtin.uri:
-    url: "{{ c3_mds_url }}/security/1.0/metadataClusterId"
-    method: GET
-    url_username: "{{ kafka_service_user }}"
-    url_password: "{{ kafka_service_password }}"
-    ca_path: "{{ c3_ssl_truststore_location }}"
-    status_code: 200
-    timeout: 30
-  register: mds_check
-  until: mds_check.status == 200
-  retries: 30
-  delay: 10
+- name: "SECRETS | Ensure {{ broker_secrets_dir }} exists"
+  ansible.builtin.file:
+    path: "{{ broker_secrets_dir }}"
+    state: directory
+    owner: "{{ broker_user }}"
+    group: "{{ broker_group }}"
+    mode: "0700"
 
-- name: "RBAC | Get Kafka cluster ID from MDS"
-  ansible.builtin.set_fact:
-    kafka_cluster_id: "{{ mds_check.json }}"
+- name: "SECRETS | Create temp directory for seed file"
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: "confluent_secrets_"
+  register: secrets_tmpdir
+  become: true
+  become_user: "{{ broker_user }}"
 
-- name: "RBAC | Login to Confluent CLI"
+- name: "SECRETS | Encrypt secrets block"
+  block:
+
+    - name: "SECRETS | Write plaintext seed file"
+      ansible.builtin.template:
+        src: "{{ role_path }}/templates/secrets-seed.properties.j2"
+        dest: "{{ secrets_tmpdir.path }}/seed-master.properties"
+        owner: "{{ broker_user }}"
+        group: "{{ broker_group }}"
+        mode: "0600"
+      no_log: true
+
+    # awk skips blank lines and comment lines (#), splits on first =,
+    # prints only the key (field 1) with whitespace stripped.
+    - name: "SECRETS | Extract property keys from seed file"
+      ansible.builtin.command:
+        argv:
+          - awk
+          - "!/^[[:space:]]*(#|$)/ && /=/ { n=index($0,\"=\"); k=substr($0,1,n-1); gsub(/[[:space:]]/,\"\",k); print k }"
+          - "{{ secrets_tmpdir.path }}/seed-master.properties"
+      register: seed_keys_raw
+      changed_when: false
+      become: true
+      become_user: "{{ broker_user }}"
+
+    - name: "SECRETS | Build secret_properties list"
+      ansible.builtin.set_fact:
+        secret_properties: "{{ seed_keys_raw.stdout_lines }}"
+
+    - name: "SECRETS | Show properties to encrypt ({{ secret_properties | length }} total)"
+      ansible.builtin.debug:
+        msg: "Will encrypt {{ secret_properties | length }} properties: {{ secret_properties }}"
+
+    - name: "SECRETS | Initialise empty local-secrets.properties"
+      ansible.builtin.file:
+        path: "{{ broker_secrets_dir }}/local-secrets.properties"
+        state: touch
+        owner: "{{ broker_user }}"
+        group: "{{ broker_group }}"
+        mode: "0600"
+
+    - name: "SECRETS | Encrypt each property"
+      ansible.builtin.include_tasks: encrypt_one_property.yml
+      loop: "{{ secret_properties }}"
+      loop_control:
+        loop_var: secret_item
+
+  always:
+    - name: "SECRETS | Always remove temp seed directory"
+      ansible.builtin.file:
+        path: "{{ secrets_tmpdir.path }}"
+        state: absent
+      become: true
+      become_user: "{{ broker_user }}"
+
+- name: "SECRETS | Count ENC[ markers in local-secrets.properties"
   ansible.builtin.command:
     argv:
-      - /usr/local/bin/confluent
-      - login
-      - "--url={{ c3_mds_url }}"
-  environment:
-    CONFLUENT_PLATFORM_USERNAME: "{{ kafka_service_user }}"
-    CONFLUENT_PLATFORM_PASSWORD: "{{ kafka_service_password }}"
-  changed_when: true
-  no_log: true
+      - grep
+      - "--fixed-strings"
+      - "--count"
+      - "ENC["
+      - "{{ broker_secrets_dir }}/local-secrets.properties"
+  register: enc_count
+  changed_when: false
+  failed_when: enc_count.rc != 0
 
-- name: "RBAC | Grant SystemAdmin on Kafka cluster"
+- name: "SECRETS | Assert all properties are encrypted"
+  ansible.builtin.assert:
+    that:
+      - enc_count.stdout | int >= secret_properties | length
+    fail_msg: >-
+      FAILED: Only {{ enc_count.stdout }} of {{ secret_properties | length }}
+      properties are encrypted in {{ broker_secrets_dir }}/local-secrets.properties
+      — plaintext values remain.
+    success_msg: >-
+      OK: {{ enc_count.stdout }} ENC[ entries found —
+      {{ secret_properties | length }} secrets encrypted successfully
+
+- name: "SECRETS | Count securepass refs in server.properties"
   ansible.builtin.command:
     argv:
-      - /usr/local/bin/confluent
-      - iam
-      - rbac
-      - role-binding
-      - create
-      - "--principal"
-      - "User:{{ c3_service_user }}"
-      - "--role"
-      - SystemAdmin
-      - "--kafka-cluster"
-      - "{{ kafka_cluster_id }}"
-  changed_when: true
+      - grep
+      - "--count"
+      - "securepass"
+      - "{{ broker_config_dir }}/server.properties"
+  register: securepass_count
+  changed_when: false
+  failed_when: securepass_count.rc != 0
 
-- name: "RBAC | Grant SystemAdmin on Connect cluster"
-  ansible.builtin.command:
-    argv:
-      - /usr/local/bin/confluent
-      - iam
-      - rbac
-      - role-binding
-      - create
-      - "--principal"
-      - "User:{{ c3_service_user }}"
-      - "--role"
-      - SystemAdmin
-      - "--kafka-cluster"
-      - "{{ kafka_cluster_id }}"
-      - "--connect-cluster"
-      - "{{ c3_connect_cluster_name }}"
-  changed_when: true
+- name: "SECRETS | Display securepass reference count"
+  ansible.builtin.debug:
+    msg: "server.properties contains {{ securepass_count.stdout }} securepass references — encryption complete"
