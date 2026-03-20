@@ -1,38 +1,48 @@
 ---
 # ==============================================================================
-# Deploy and encrypt Confluent SecurePass secrets
+# Deploy and encrypt Confluent SecurePass secrets for Control Center
 #
 # To add a new secret:
-#   1. Add the value to roles/vars/secret.yml (vault encrypted)
-#   2. Add the key = {{ variable }} line to secrets-seed.properties.j2
+#   1. Add the value to roles/vars/c3-secret.yml (vault encrypted)
+#   2. Add the key = {{ variable }} line to c3-secrets-seed.properties.j2
 #   That is all — the key list and assertion are fully dynamic.
 # ==============================================================================
 
-- name: "SECRETS | Ensure {{ broker_secrets_dir }} exists"
+- name: "SECRETS | Load secret variables"
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../vars/c3-secret.yml"
+  no_log: true
+
+- name: "SECRETS | Read CONFLUENT_SECURITY_MASTER_KEY from vault"
+  ansible.builtin.set_fact:
+    CONFLUENT_SECURITY_MASTER_KEY: "{{ CONFLUENT_SECURITY_MASTER_KEY }}"
+  no_log: true
+
+- name: "SECRETS | Ensure {{ c3_secrets_dir }} exists"
   ansible.builtin.file:
-    path: "{{ broker_secrets_dir }}"
+    path: "{{ c3_secrets_dir }}"
     state: directory
-    owner: "{{ broker_user }}"
-    group: "{{ broker_group }}"
+    owner: "{{ c3_user }}"
+    group: "{{ c3_group }}"
     mode: "0700"
 
 - name: "SECRETS | Create temp directory for seed file"
   ansible.builtin.tempfile:
     state: directory
-    prefix: "confluent_secrets_"
-  register: secrets_tmpdir
+    prefix: "c3_secrets_"
+  register: c3_secrets_tmpdir
   become: true
-  become_user: "{{ broker_user }}"
+  become_user: "{{ c3_user }}"
 
 - name: "SECRETS | Encrypt secrets block"
   block:
 
     - name: "SECRETS | Write plaintext seed file"
       ansible.builtin.template:
-        src: "{{ role_path }}/templates/secrets-seed.properties.j2"
-        dest: "{{ secrets_tmpdir.path }}/seed-master.properties"
-        owner: "{{ broker_user }}"
-        group: "{{ broker_group }}"
+        src: "{{ role_path }}/templates/c3-secrets-seed.properties.j2"
+        dest: "{{ c3_secrets_tmpdir.path }}/seed-master.properties"
+        owner: "{{ c3_user }}"
+        group: "{{ c3_group }}"
         mode: "0600"
         force: true
       no_log: true
@@ -42,25 +52,25 @@
         argv:
           - awk
           - '!/^[[:space:]]*(#|$)/ && /=/ { n=index($0,"="); k=substr($0,1,n-1); gsub(/[[:space:]]/,"",k); print k }'
-          - "{{ secrets_tmpdir.path }}/seed-master.properties"
-      register: seed_keys_raw
+          - "{{ c3_secrets_tmpdir.path }}/seed-master.properties"
+      register: c3_seed_keys_raw
       changed_when: false
       become: true
-      become_user: "{{ broker_user }}"
+      become_user: "{{ c3_user }}"
 
     - name: "SECRETS | Build secret_properties list"
       ansible.builtin.set_fact:
-        secret_properties: "{{ seed_keys_raw.stdout_lines }}"
+        c3_secret_properties: "{{ c3_seed_keys_raw.stdout_lines }}"
 
-    - name: "SECRETS | Show properties to encrypt ({{ secret_properties | length }} total)"
+    - name: "SECRETS | Show properties to encrypt ({{ c3_secret_properties | length }} total)"
       ansible.builtin.debug:
-        msg: "Will encrypt {{ secret_properties | length }} properties: {{ secret_properties }}"
+        msg: "Will encrypt {{ c3_secret_properties | length }} properties"
 
     # Rotate up to 5 backups before recreating — no manual deletion needed
     - name: "SECRETS | Rotate local-secrets.properties backups (keep 5)"
       ansible.builtin.shell:
         cmd: |
-          f="{{ broker_secrets_dir }}/local-secrets.properties"
+          f="{{ c3_secrets_dir }}/local-secrets.properties"
           if [ -f "$f" ]; then
             for i in 4 3 2 1; do
               [ -f "${f}.${i}" ] && mv "${f}.${i}" "${f}.$((i+1))"
@@ -69,35 +79,35 @@
           fi
       changed_when: true
       become: true
-      become_user: "{{ broker_user }}"
+      become_user: "{{ c3_user }}"
       failed_when: false
 
     - name: "SECRETS | Remove existing local-secrets.properties to force clean recreate"
       ansible.builtin.file:
-        path: "{{ broker_secrets_dir }}/local-secrets.properties"
+        path: "{{ c3_secrets_dir }}/local-secrets.properties"
         state: absent
 
     - name: "SECRETS | Initialise empty local-secrets.properties"
       ansible.builtin.file:
-        path: "{{ broker_secrets_dir }}/local-secrets.properties"
+        path: "{{ c3_secrets_dir }}/local-secrets.properties"
         state: touch
-        owner: "{{ broker_user }}"
-        group: "{{ broker_group }}"
+        owner: "{{ c3_user }}"
+        group: "{{ c3_group }}"
         mode: "0600"
 
     - name: "SECRETS | Encrypt each property"
-      ansible.builtin.include_tasks: encrypt_one_property.yml
-      loop: "{{ secret_properties }}"
+      ansible.builtin.include_tasks: c3_encrypt_one_property.yml
+      loop: "{{ c3_secret_properties }}"
       loop_control:
-        loop_var: secret_item
+        loop_var: c3_secret_item
 
   always:
     - name: "SECRETS | Always remove temp seed directory"
       ansible.builtin.file:
-        path: "{{ secrets_tmpdir.path }}"
+        path: "{{ c3_secrets_tmpdir.path }}"
         state: absent
       become: true
-      become_user: "{{ broker_user }}"
+      become_user: "{{ c3_user }}"
 
 - name: "SECRETS | Count ENC[ markers in local-secrets.properties"
   ansible.builtin.command:
@@ -106,34 +116,18 @@
       - "--fixed-strings"
       - "--count"
       - "ENC["
-      - "{{ broker_secrets_dir }}/local-secrets.properties"
-  register: enc_count
+      - "{{ c3_secrets_dir }}/local-secrets.properties"
+  register: c3_enc_count
   changed_when: false
-  failed_when: enc_count.rc != 0
+  failed_when: c3_enc_count.rc != 0
 
 - name: "SECRETS | Assert all properties are encrypted"
   ansible.builtin.assert:
     that:
-      - enc_count.stdout | int >= secret_properties | length
+      - c3_enc_count.stdout | int >= c3_secret_properties | length
     fail_msg: >-
-      FAILED: Only {{ enc_count.stdout }} of {{ secret_properties | length }}
-      properties are encrypted in {{ broker_secrets_dir }}/local-secrets.properties
-      — plaintext values remain.
+      FAILED: Only {{ c3_enc_count.stdout }} of {{ c3_secret_properties | length }}
+      properties encrypted in {{ c3_secrets_dir }}/local-secrets.properties
     success_msg: >-
-      OK: {{ enc_count.stdout }} ENC[ entries found —
-      {{ secret_properties | length }} secrets encrypted successfully
-
-- name: "SECRETS | Count securepass refs in server.properties"
-  ansible.builtin.command:
-    argv:
-      - grep
-      - "--count"
-      - "securepass"
-      - "{{ broker_config_dir }}/server.properties"
-  register: securepass_count
-  changed_when: false
-  failed_when: securepass_count.rc != 0
-
-- name: "SECRETS | Display securepass reference count"
-  ansible.builtin.debug:
-    msg: "server.properties contains {{ securepass_count.stdout }} securepass references — encryption complete"
+      OK: {{ c3_enc_count.stdout }} ENC[ entries —
+      {{ c3_secret_properties | length }} secrets encrypted successfully
