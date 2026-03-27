@@ -1,0 +1,27 @@
+---
+# ==============================================================================
+# Create confluent user and group
+# Source: users.yml (repo 2)
+# ==============================================================================
+
+- name: "USERS | Ensure confluent group exists"
+  ansible.builtin.group:
+    name: "{{ confluent_group }}"
+    state: present
+
+- name: "USERS | Ensure confluent user exists"
+  ansible.builtin.user:
+    name: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    shell: /bin/bash
+    create_home: true
+    state: present
+
+- name: "USERS | Allow passwordless sudo for confluent"
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/confluent
+    content: "confluent ALL=(ALL) NOPASSWD: ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"

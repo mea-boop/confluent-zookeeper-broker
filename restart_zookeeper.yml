@@ -1,0 +1,218 @@
+---
+# ==============================================================================
+# Confluent ZooKeeper Rolling Restart Playbook
+# Strategy: Restart followers first, leader last
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Play 1 — Discover cluster state
+# ------------------------------------------------------------------------------
+- name: Discover Cluster State
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: true
+  serial: 100%
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+
+  tasks:
+    - name: "DISCOVER | Check ZooKeeper service status"
+      ansible.builtin.systemd:
+        name: "{{ zookeeper_service_name }}"
+      register: zk_service
+      failed_when: false
+
+    - name: "DISCOVER | Get ZooKeeper mode"
+      ansible.builtin.shell:
+        cmd: "echo stat | nc localhost {{ zookeeper_client_port }} | grep Mode | awk '{print $2}'"
+      register: zk_mode
+      changed_when: false
+      failed_when: false
+      when: zk_service.status.ActiveState == "active"
+
+    - name: "DISCOVER | Set node role facts"
+      ansible.builtin.set_fact:
+        zookeeper_role: "{{ zk_mode.stdout | default('unknown') }}"
+        is_leader: "{{ (zk_mode.stdout | default('')) == 'leader' }}"
+        is_follower: "{{ (zk_mode.stdout | default('')) == 'follower' }}"
+        cacheable: true
+
+    - name: "DISCOVER | Display node role"
+      ansible.builtin.debug:
+        msg: "{{ ansible_fqdn }} role: {{ zookeeper_role }}"
+
+# ------------------------------------------------------------------------------
+# Play 2 — Restart followers first (serial 1)
+# ------------------------------------------------------------------------------
+- name: Restart Followers First
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+
+  tasks:
+    - name: "FOLLOWER | Rolling restart"
+      when: is_follower | default(false) | bool
+      block:
+        - name: "FOLLOWER | Display restart message"
+          ansible.builtin.debug:
+            msg: "Restarting FOLLOWER: {{ ansible_fqdn }}"
+
+        - name: "FOLLOWER | Stop ZooKeeper"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: stopped
+
+        - name: "FOLLOWER | Wait for port to close"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: stopped
+            timeout: 60
+
+        - name: "FOLLOWER | Start ZooKeeper"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: started
+
+        - name: "FOLLOWER | Wait for port to open"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: started
+            delay: 5
+            timeout: 120
+
+        - name: "FOLLOWER | Wait for stabilization"
+          ansible.builtin.pause:
+            seconds: "{{ restart_wait_time }}"
+
+        - name: "FOLLOWER | Verify health"
+          ansible.builtin.shell:
+            cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+          register: health_check
+          retries: "{{ restart_max_retries }}"
+          delay: "{{ restart_retry_delay }}"
+          until: health_check.stdout == "imok"
+          changed_when: false
+
+        - name: "FOLLOWER | Restart complete"
+          ansible.builtin.debug:
+            msg: "✓ {{ ansible_fqdn }} (follower) restarted successfully"
+
+# ------------------------------------------------------------------------------
+# Play 3 — Restart leader last (serial 1)
+# ------------------------------------------------------------------------------
+- name: Restart Leader Last
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+
+  tasks:
+    - name: "LEADER | Rolling restart"
+      when: is_leader | default(false) | bool
+      block:
+        - name: "LEADER | Display leader restart warning"
+          ansible.builtin.debug:
+            msg: "Restarting LEADER: {{ ansible_fqdn }} — leader election will occur"
+
+        - name: "LEADER | Pause before leader restart"
+          ansible.builtin.pause:
+            seconds: 10
+
+        - name: "LEADER | Stop ZooKeeper"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: stopped
+
+        - name: "LEADER | Wait for port to close"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: stopped
+            timeout: 60
+
+        - name: "LEADER | Start ZooKeeper"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: started
+
+        - name: "LEADER | Wait for port to open"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: started
+            delay: 5
+            timeout: 120
+
+        - name: "LEADER | Wait for leader election"
+          ansible.builtin.pause:
+            seconds: 15
+
+        - name: "LEADER | Verify health"
+          ansible.builtin.shell:
+            cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+          register: health_check
+          retries: "{{ restart_max_retries }}"
+          delay: "{{ restart_retry_delay }}"
+          until: health_check.stdout == "imok"
+          changed_when: false
+
+        - name: "LEADER | Restart complete"
+          ansible.builtin.debug:
+            msg: "✓ {{ ansible_fqdn }} (leader) restarted successfully"
+
+# ------------------------------------------------------------------------------
+# Play 4 — Final cluster health verification
+# ------------------------------------------------------------------------------
+- name: Verify Cluster Health
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+
+  tasks:
+    - name: "VERIFY | Get final mode"
+      ansible.builtin.shell:
+        cmd: "echo stat | nc localhost {{ zookeeper_client_port }} | grep Mode"
+      register: final_mode
+      changed_when: false
+      failed_when: false
+
+    - name: "VERIFY | Assert service is active"
+      ansible.builtin.systemd:
+        name: "{{ zookeeper_service_name }}"
+      register: final_status
+
+    - name: "VERIFY | Assert ZooKeeper is running"
+      ansible.builtin.assert:
+        that:
+          - final_status.status.ActiveState == "active"
+        fail_msg: "ZooKeeper is NOT running on {{ ansible_fqdn }}"
+        success_msg: "ZooKeeper is active on {{ ansible_fqdn }}"
+
+    - name: "VERIFY | Display final cluster state"
+      ansible.builtin.debug:
+        msg: "{{ ansible_fqdn }}: {{ final_mode.stdout | default('unknown') }}"
+
+    - name: "VERIFY | Rolling restart complete"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          ZooKeeper Rolling Restart Complete
+          ============================================
+          {% for host in groups['zookeeper_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }}: {{ hostvars[host]['final_mode']['stdout'] | default('unknown') }}
+          {% endfor %}
+          ============================================
+      run_once: true

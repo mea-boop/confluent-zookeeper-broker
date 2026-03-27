@@ -1,0 +1,56 @@
+---
+# ==============================================================================
+# Create Kafka SCRAM-SHA-256 user in ZooKeeper
+# Runs after broker is validated and ZooKeeper is up
+# ==============================================================================
+
+- name: "KAFKA_USER | Load secret variables"
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../vars/secret.yml"
+  no_log: true
+
+- name: "KAFKA_USER | Verify ZooKeeper is reachable"
+  ansible.builtin.shell:
+    cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+  register: zk_health
+  changed_when: false
+  failed_when: zk_health.stdout != "imok"
+
+- name: "KAFKA_USER | Create SCRAM-SHA-256 credentials for {{ kafka_admin_username }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ zookeeper_install_dir }}/bin/kafka-configs"
+      - "--zookeeper"
+      - "localhost:{{ zookeeper_client_port }}"
+      - "--alter"
+      - "--add-config"
+      - "SCRAM-SHA-256=[iterations=8192,password={{ kafka_admin_password }}]"
+      - "--entity-type"
+      - "users"
+      - "--entity-name"
+      - "{{ kafka_admin_username }}"
+  register: create_user_result
+  changed_when: true
+  no_log: true
+
+- name: "KAFKA_USER | Display result"
+  ansible.builtin.debug:
+    msg: "{{ create_user_result.stdout }}"
+
+- name: "KAFKA_USER | Verify user was created"
+  ansible.builtin.command:
+    argv:
+      - "{{ zookeeper_install_dir }}/bin/kafka-configs"
+      - "--zookeeper"
+      - "localhost:{{ zookeeper_client_port }}"
+      - "--describe"
+      - "--entity-type"
+      - "users"
+      - "--entity-name"
+      - "{{ kafka_admin_username }}"
+  register: verify_user
+  changed_when: false
+
+- name: "KAFKA_USER | Display user config"
+  ansible.builtin.debug:
+    msg: "{{ verify_user.stdout }}"

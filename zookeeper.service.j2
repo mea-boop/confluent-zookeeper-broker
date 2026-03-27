@@ -1,0 +1,47 @@
+[Unit]
+Description=Apache Kafka ZooKeeper (Confluent {{ confluent_package_version }})
+Documentation=https://docs.confluent.io
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ zookeeper_user }}
+Group={{ zookeeper_group }}
+
+# Environment file (KEY=VALUE format)
+EnvironmentFile={{ zookeeper_install_dir }}/bin/zookeeper-env.sh
+
+# Override heap opts explicitly (ensures systemd picks them up)
+Environment="KAFKA_HEAP_OPTS={{ zookeeper_heap_opts }}"
+Environment="LOG_DIR={{ zookeeper_log_dir }}"
+
+{% if prometheus_jmx_exporter_enabled | bool %}
+# Verify Prometheus files exist before starting
+ExecStartPre=/bin/bash -c '[ -f "{{ prometheus_jmx_exporter_jar }}" ] || { echo "ERROR: Prometheus JAR not found at {{ prometheus_jmx_exporter_jar }}"; exit 1; }'
+ExecStartPre=/bin/bash -c '[ -f "{{ prometheus_jmx_config }}" ] || { echo "ERROR: Prometheus config not found at {{ prometheus_jmx_config }}"; exit 1; }'
+
+# Start with Prometheus JMX agent
+ExecStart=/bin/bash -c 'KAFKA_OPTS="-javaagent:{{ prometheus_jmx_exporter_jar }}={{ prometheus_jmx_exporter_port }}:{{ prometheus_jmx_config }}" exec {{ zookeeper_install_dir }}/bin/zookeeper-server-start {{ zookeeper_install_dir }}/etc/kafka/zookeeper.properties'
+{% else %}
+ExecStart={{ zookeeper_install_dir }}/bin/zookeeper-server-start {{ zookeeper_install_dir }}/etc/kafka/zookeeper.properties
+{% endif %}
+
+ExecStop={{ zookeeper_install_dir }}/bin/zookeeper-server-stop
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=180
+
+LimitNOFILE=100000
+LimitNPROC=32768
+
+WorkingDirectory={{ zookeeper_install_dir }}
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zookeeper
+
+[Install]
+WantedBy=multi-user.target

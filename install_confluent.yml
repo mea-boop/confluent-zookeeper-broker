@@ -1,0 +1,276 @@
+---
+# ==============================================================================
+# Install Confluent Platform — Full Stack
+# Software cache: /app/zookeeper/software (permanent — never deleted)
+# All downloads stored here and reused on subsequent runs
+# Mount points:
+#   /app/zookeeper  — software install + ZooKeeper data + software cache
+#   /app/log        — all logs
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Software cache directory
+# ------------------------------------------------------------------------------
+- name: "SOFTWARE | Ensure software cache directory exists"
+  ansible.builtin.file:
+    path: "{{ zk_software_dir }}"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+
+# ------------------------------------------------------------------------------
+# Java JDK 17
+# ------------------------------------------------------------------------------
+- name: "JAVA | Check if Java 17 is already installed"
+  ansible.builtin.command: java -version
+  register: java_check
+  failed_when: false
+  changed_when: false
+
+- name: "JAVA | Check if JDK RPM already downloaded"
+  ansible.builtin.stat:
+    path: "{{ zk_software_dir }}/jdk-17.0.8_linux-x64_bin.rpm"
+  register: jdk_rpm_stat
+
+- name: "JAVA | Download JDK 17 RPM to software cache"
+  ansible.builtin.get_url:
+    url: "{{ artifactory_base_url }}/{{ artifactory_repo }}/java-jdk/v17_x64/jdk-17.0.8_linux-x64_bin.rpm"
+    dest: "{{ zk_software_dir }}/jdk-17.0.8_linux-x64_bin.rpm"
+    mode: "0644"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    url_username: "{{ artifactory_user }}"
+    url_password: "{{ artifactory_password }}"
+  when: not jdk_rpm_stat.stat.exists
+  no_log: true
+
+- name: "JAVA | Install JDK 17 RPM"
+  ansible.builtin.yum:
+    name: "{{ zk_software_dir }}/jdk-17.0.8_linux-x64_bin.rpm"
+    state: present
+    disable_gpg_check: true
+  when: java_check.rc != 0
+
+- name: "JAVA | Verify Java installation"
+  ansible.builtin.command: java -version
+  register: java_verify
+  changed_when: false
+  failed_when: java_verify.rc != 0
+
+- name: "JAVA | Display Java version"
+  ansible.builtin.debug:
+    msg: "{{ java_verify.stderr }}"
+
+# ------------------------------------------------------------------------------
+# pip upgrade
+# ------------------------------------------------------------------------------
+- name: "PIP | Install python3-pip via yum"
+  ansible.builtin.yum:
+    name: python3-pip
+    state: present
+
+- name: "PIP | Check if pip wheel already downloaded"
+  ansible.builtin.stat:
+    path: "{{ zk_software_dir }}/pip-25.1.1-py3-none-any.whl"
+  register: pip_whl_stat
+
+- name: "PIP | Download pip wheel to software cache"
+  ansible.builtin.get_url:
+    url: "{{ artifactory_base_url }}/penalty-APPSVC066253-pypi-local/29/a2/d40fb2460e883eca5199c62cfc2463fd261f760556ae6290f88488c362c0/pip-25.1.1-py3-none-any.whl"
+    dest: "{{ zk_software_dir }}/pip-25.1.1-py3-none-any.whl"
+    mode: "0644"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    url_username: "{{ artifactory_user }}"
+    url_password: "{{ artifactory_password }}"
+  when: not pip_whl_stat.stat.exists
+  no_log: true
+
+- name: "PIP | Upgrade pip from cached wheel"
+  ansible.builtin.command:
+    cmd: "python3 -m pip install --upgrade {{ zk_software_dir }}/pip-25.1.1-py3-none-any.whl"
+  changed_when: true
+
+- name: "PIP | Install cryptography package from Artifactory PyPI"
+  ansible.builtin.pip:
+    name: cryptography
+    extra_args: >-
+      --index-url=https://{{ artifactory_user | urlencode }}:{{ artifactory_password | urlencode }}@humana.jfrog.io/artifactory/api/pypi/pythonhosted-pypi-remote/simple
+    executable: pip3
+  no_log: true
+
+# ------------------------------------------------------------------------------
+# Prometheus JMX Exporter
+# ------------------------------------------------------------------------------
+- name: "PROMETHEUS | Ensure Prometheus directories exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+  loop:
+    - /opt/prometheus
+    - /opt/prometheus/prometheus-config
+
+- name: "PROMETHEUS | Check if Prometheus zip already downloaded"
+  ansible.builtin.stat:
+    path: "{{ zk_software_dir }}/prometheus.zip"
+  register: prometheus_zip_stat
+
+- name: "PROMETHEUS | Download Prometheus zip to software cache"
+  ansible.builtin.get_url:
+    url: "{{ artifactory_base_url }}/{{ artifactory_repo }}/prometheus/prometheus.zip"
+    dest: "{{ zk_software_dir }}/prometheus.zip"
+    mode: "0644"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    url_username: "{{ artifactory_user }}"
+    url_password: "{{ artifactory_password }}"
+  when: not prometheus_zip_stat.stat.exists
+  no_log: true
+
+- name: "PROMETHEUS | Extract Prometheus from software cache"
+  ansible.builtin.unarchive:
+    src: "{{ zk_software_dir }}/prometheus.zip"
+    dest: /opt/prometheus
+    remote_src: true
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+
+- name: "PROMETHEUS | Set Prometheus permissions"
+  ansible.builtin.file:
+    path: /opt/prometheus
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    recurse: true
+    mode: "0755"
+
+# ------------------------------------------------------------------------------
+# SSL Certificates
+# ------------------------------------------------------------------------------
+- name: "SSL | Ensure SSL directory exists"
+  ansible.builtin.file:
+    path: /opt/ssl
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0750"
+
+- name: "SSL | Check which SSL certs are already downloaded"
+  ansible.builtin.stat:
+    path: "{{ zk_software_dir }}/ssl/{{ item }}"
+  register: ssl_cert_stats
+  loop: "{{ ssl_cert_files }}"
+
+- name: "SSL | Download SSL certificates to software cache"
+  ansible.builtin.get_url:
+    url: "{{ artifactory_base_url }}/{{ artifactory_repo }}/confluent-v3/certificates/{{ item.item }}"
+    dest: "{{ zk_software_dir }}/ssl/{{ item.item }}"
+    mode: "0640"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    url_username: "{{ artifactory_user }}"
+    url_password: "{{ artifactory_password }}"
+  loop: "{{ ssl_cert_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not item.stat.exists
+  no_log: true
+
+- name: "SSL | Copy SSL certificates from software cache to /opt/ssl"
+  ansible.builtin.copy:
+    src: "{{ zk_software_dir }}/ssl/{{ item }}"
+    dest: "/opt/ssl/{{ item }}"
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0640"
+    remote_src: true
+  loop: "{{ ssl_cert_files }}"
+
+# ------------------------------------------------------------------------------
+# Confluent Platform
+# ------------------------------------------------------------------------------
+- name: "CONFLUENT | Check if already installed"
+  ansible.builtin.stat:
+    path: "{{ zookeeper_install_dir }}/bin/zookeeper-server-start"
+  register: confluent_installed
+
+- name: "CONFLUENT | Check if package already in software cache"
+  ansible.builtin.stat:
+    path: "{{ zk_software_dir }}/{{ confluent_package }}"
+  register: confluent_pkg_stat
+
+- name: "CONFLUENT | Download package to software cache via curl"
+  ansible.builtin.command:
+    argv:
+      - curl
+      - "--silent"
+      - "--fail"
+      - "--show-error"
+      - "--retry"
+      - "3"
+      - "--retry-delay"
+      - "5"
+      - "--output"
+      - "{{ zk_software_dir }}/{{ confluent_package }}"
+      - "--user"
+      - "{{ artifactory_user }}:{{ artifactory_password }}"
+      - "{{ artifactory_base_url }}/{{ artifactory_repo }}/confluent/{{ confluent_package }}"
+  when: not confluent_pkg_stat.stat.exists
+  changed_when: true
+  no_log: true
+
+- name: "CONFLUENT | Display cached package info"
+  ansible.builtin.stat:
+    path: "{{ zk_software_dir }}/{{ confluent_package }}"
+  register: cached_pkg
+
+- name: "CONFLUENT | Show package size"
+  ansible.builtin.debug:
+    msg: "Using cached {{ confluent_package }} — size: {{ cached_pkg.stat.size | filesizeformat }}"
+
+- name: "CONFLUENT | Ensure install directory exists"
+  ansible.builtin.file:
+    path: "{{ zookeeper_install_dir }}"
+    state: directory
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0755"
+
+- name: "CONFLUENT | Extract package from software cache to install directory"
+  ansible.builtin.unarchive:
+    src: "{{ zk_software_dir }}/{{ confluent_package }}"
+    dest: "{{ zookeeper_install_dir }}"
+    remote_src: true
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    extra_opts:
+      - "--strip-components=1"
+  when: not confluent_installed.stat.exists
+
+- name: "CONFLUENT | Verify ZooKeeper binary"
+  ansible.builtin.stat:
+    path: "{{ zookeeper_install_dir }}/bin/zookeeper-server-start"
+  register: zk_binary
+
+- name: "CONFLUENT | Fail if ZooKeeper binary not found"
+  ansible.builtin.fail:
+    msg: "ZooKeeper binary not found at {{ zookeeper_install_dir }}/bin — check extraction"
+  when: not zk_binary.stat.exists
+
+- name: "CONFLUENT | Display software cache contents"
+  ansible.builtin.find:
+    paths: "{{ zk_software_dir }}"
+    recurse: true
+    file_type: file
+  register: software_cache_contents
+
+- name: "CONFLUENT | Show software cache"
+  ansible.builtin.debug:
+    msg: "Software cache ({{ zk_software_dir }}): {{ software_cache_contents.files | map(attribute='path') | list }}"
+
+- name: "CONFLUENT | Installation complete"
+  ansible.builtin.debug:
+    msg: "Confluent {{ confluent_package_version }} installed at {{ zookeeper_install_dir }}"

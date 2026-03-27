@@ -1,0 +1,22 @@
+---
+# ==============================================================================
+# Start ZooKeeper service
+# ==============================================================================
+
+- name: "START | Enable ZooKeeper service"
+  ansible.builtin.systemd:
+    name: "{{ zookeeper_service_name }}"
+    enabled: true
+    daemon_reload: true
+
+- name: "START | Start ZooKeeper service"
+  ansible.builtin.systemd:
+    name: "{{ zookeeper_service_name }}"
+    state: started
+
+- name: "START | Wait for ZooKeeper client port"
+  ansible.builtin.wait_for:
+    host: "{{ ansible_fqdn }}"
+    port: "{{ zookeeper_client_port }}"
+    delay: 10
+    timeout: 120

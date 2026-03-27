@@ -1,0 +1,33 @@
+---
+# ==============================================================================
+# Create application directories
+# ==============================================================================
+
+- name: "DIRS | Create ZooKeeper data directory"
+  ansible.builtin.file:
+    path: "{{ zookeeper_data_dir }}"
+    state: directory
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0755"
+    recurse: true
+
+- name: "DIRS | Create ZooKeeper log directory"
+  ansible.builtin.file:
+    path: "{{ zookeeper_log_dir }}"
+    state: directory
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0755"
+    recurse: true
+
+- name: "DIRS | Create Prometheus directories"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0755"
+  loop:
+    - /opt/prometheus
+    - /opt/prometheus/prometheus-config

@@ -1,0 +1,26 @@
+---
+# ==============================================================================
+# Setup Prometheus JMX Exporter
+# ==============================================================================
+
+- name: "PROMETHEUS | Download JMX Exporter JAR from Artifactory"
+  ansible.builtin.get_url:
+    url: "{{ artifactory_base_url }}/{{ artifactory_repo }}/prometheus/jmx_prometheus_javaagent.jar"
+    dest: "{{ prometheus_jmx_exporter_jar }}"
+    url_username: "{{ artifactory_user }}"
+    url_password: "{{ artifactory_password }}"
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0644"
+  register: jmx_download
+  retries: 3
+  delay: 5
+  until: jmx_download is succeeded
+
+- name: "PROMETHEUS | Deploy JMX configuration"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/jmx-zookeeper-prometheus.yml"
+    dest: "{{ prometheus_jmx_config }}"
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0644"

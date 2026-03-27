@@ -1,0 +1,42 @@
+---
+# ==============================================================================
+# ZooKeeper Role — Main Task Entry Point
+# ==============================================================================
+
+- name: "ZOOKEEPER | Display deployment info"
+  ansible.builtin.debug:
+    msg: "Deploying ZooKeeper on {{ ansible_fqdn }}"
+
+- name: "ZOOKEEPER | Create user and group"
+  ansible.builtin.include_tasks: users.yml
+  when: create_zookeeper_user | bool
+
+- name: "ZOOKEEPER | Apply OS tuning (limits, sysctl, THP, firewall)"
+  ansible.builtin.include_tasks: os_tune.yml
+
+- name: "ZOOKEEPER | Setup disk storage"
+  ansible.builtin.include_tasks: dir_storage.yml
+
+- name: "ZOOKEEPER | Create application directories"
+  ansible.builtin.include_tasks: create_directories.yml
+
+- name: "ZOOKEEPER | Install Confluent from Artifactory"
+  ansible.builtin.include_tasks: install_confluent.yml
+
+- name: "ZOOKEEPER | Setup Prometheus JMX Exporter"
+  ansible.builtin.include_tasks: setup_prometheus.yml
+  when: prometheus_jmx_exporter_enabled | bool
+
+- name: "ZOOKEEPER | Configure ZooKeeper"
+  ansible.builtin.include_tasks: configure_service.yml
+
+- name: "ZOOKEEPER | Configure systemd service"
+  ansible.builtin.include_tasks: configure.yml
+
+- name: "ZOOKEEPER | Start ZooKeeper service"
+  ansible.builtin.include_tasks: start_service.yml
+  when: start_zookeeper | bool
+
+- name: "ZOOKEEPER | Validate deployment"
+  ansible.builtin.include_tasks: validate.yml
+  when: validate_deployment | bool

@@ -1,0 +1,75 @@
+---
+# ==============================================================================
+# Configure ZooKeeper properties, env, log4j
+# ==============================================================================
+
+- name: "CONFIG | Resolve ZooKeeper ID from inventory position"
+  ansible.builtin.set_fact:
+    zookeeper_id: "{{ groups['zookeeper_nodes'].index(inventory_hostname) + 1 }}"
+    cacheable: true
+
+- name: "CONFIG | Display ZooKeeper ID"
+  ansible.builtin.debug:
+    msg: "ZooKeeper ID {{ zookeeper_id }} assigned to {{ ansible_fqdn }}"
+
+- name: "CONFIG | Verify all nodes have FQDN"
+  ansible.builtin.assert:
+    that:
+      - hostvars[item]['ansible_fqdn'] is defined
+      - hostvars[item]['ansible_fqdn'] != ''
+    fail_msg: "FQDN not resolved for {{ item }}"
+    success_msg: "FQDN verified: {{ hostvars[item]['ansible_fqdn'] }}"
+  loop: "{{ groups['zookeeper_nodes'] }}"
+  run_once: true
+
+- name: "CONFIG | Display cluster configuration"
+  ansible.builtin.debug:
+    msg: |
+      ZooKeeper Cluster:
+      {% for host in groups['zookeeper_nodes'] %}
+      server.{{ loop.index }}={{ hostvars[host]['ansible_fqdn'] }}:{{ zookeeper_peer_port }}:{{ zookeeper_leader_port }}
+      {% endfor %}
+  run_once: true
+
+- name: "CONFIG | Create Kafka config directory"
+  ansible.builtin.file:
+    path: "{{ zookeeper_install_dir }}/etc/kafka"
+    state: directory
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0755"
+
+- name: "CONFIG | Write myid file"
+  ansible.builtin.copy:
+    content: "{{ zookeeper_id }}"
+    dest: "{{ zookeeper_data_dir }}/myid"
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0644"
+
+- name: "CONFIG | Deploy zookeeper.properties"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/zookeeper.properties.j2"
+    dest: "{{ zookeeper_install_dir }}/etc/kafka/zookeeper.properties"
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0644"
+    force: true
+
+- name: "CONFIG | Deploy zookeeper-env.sh"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/zookeeper-env.sh.j2"
+    dest: "{{ zookeeper_install_dir }}/bin/zookeeper-env.sh"
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0755"
+    force: true
+
+- name: "CONFIG | Deploy log4j.properties"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/log4j.properties.j2"
+    dest: "{{ zookeeper_install_dir }}/etc/kafka/log4j.properties"
+    owner: "{{ zookeeper_user }}"
+    group: "{{ zookeeper_group }}"
+    mode: "0644"
+    force: true

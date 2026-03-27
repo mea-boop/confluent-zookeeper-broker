@@ -1,0 +1,18 @@
+---
+# ==============================================================================
+# Confluent ZooKeeper Deployment Playbook
+# Merged from both repos — unified for AAP
+# Hosts: zookeeper_nodes (defined in AAP inventory)
+# ==============================================================================
+- name: Deploy Confluent ZooKeeper Cluster
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+
+  tasks:
+    - name: Deploy ZooKeeper
+      ansible.builtin.include_role:
+        name: ../roles/zookeeper

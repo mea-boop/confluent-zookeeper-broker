@@ -1,0 +1,67 @@
+---
+# ==============================================================================
+# Disk formatting, mounting, and directory creation
+# Source: dir_storage.yml (repo 2)
+# ==============================================================================
+
+- name: "STORAGE | Create base data directories"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+  loop: "{{ zk_data_dirs }}"
+
+- name: "STORAGE | Ensure mount point directories exist"
+  ansible.builtin.file:
+    path: "{{ item.mount_point }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ zookeeper_disks }}"
+
+- name: "STORAGE | Unmount disks if previously mounted at old paths"
+  ansible.builtin.mount:
+    path: "{{ item.mount_point }}"
+    state: unmounted
+  loop: "{{ zookeeper_disks_umount }}"
+  ignore_errors: true
+
+- name: "STORAGE | Remove old fstab entries"
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: "{{ item.device | regex_escape() }}"
+    state: absent
+  loop: "{{ zookeeper_disks_umount }}"
+
+- name: "STORAGE | Format disks as {{ filesystem_type }}"
+  community.general.filesystem:
+    fstype: "{{ filesystem_type }}"
+    dev: "{{ item.device }}"
+  loop: "{{ zookeeper_disks }}"
+
+- name: "STORAGE | Get UUIDs of disks"
+  ansible.builtin.command:
+    cmd: "blkid -s UUID -o value {{ item.device }}"
+  register: disk_uuids
+  changed_when: false
+  loop: "{{ zookeeper_disks }}"
+
+- name: "STORAGE | Mount disks by UUID and persist in fstab"
+  ansible.builtin.mount:
+    path: "{{ item.0.mount_point }}"
+    src: "UUID={{ item.1.stdout }}"
+    fstype: "{{ filesystem_type }}"
+    opts: "{{ mount_options }}"
+    state: mounted
+  loop: "{{ zookeeper_disks | zip(disk_uuids.results) | list }}"
+
+- name: "STORAGE | Set ownership on mount points"
+  ansible.builtin.file:
+    path: "{{ item.mount_point }}"
+    state: directory
+    owner: "{{ confluent_user }}"
+    group: "{{ confluent_group }}"
+    mode: "0755"
+    recurse: true
+  loop: "{{ zookeeper_disks }}"

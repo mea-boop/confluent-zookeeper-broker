@@ -1,0 +1,163 @@
+---
+# ==============================================================================
+# Create Kafka SCRAM-SHA-256 Users in ZooKeeper
+# Run AFTER broker is deployed and validated
+# Run on ONE ZooKeeper node only (run_once) — ZK replicates to all nodes
+#
+# AAP Usage:
+#   Job Template: create_kafka_users
+#   Inventory   : zookeeper_nodes
+#   Credentials : vault credential + machine credential
+# ==============================================================================
+
+- name: Create Kafka Users in ZooKeeper
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: true
+  run_once: true          # ZooKeeper replicates — only need to run on one node
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+    - ../roles/vars/secret.yml
+
+  vars:
+    # Additional users beyond admin — add more entries as needed
+    kafka_scram_users:
+      - username: "{{ kafka_admin_username }}"
+        password: "{{ kafka_admin_password }}"
+        description: "Kafka admin user"
+      - username: "EEH_C3E_AZ_KFKA_DEV"
+        password: "{{ kafka_service_password }}"
+        description: "Kafka service account"
+
+  tasks:
+
+    - name: "PRE | Verify ZooKeeper is healthy"
+      ansible.builtin.shell:
+        cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+      register: zk_health
+      changed_when: false
+      failed_when: zk_health.stdout != "imok"
+
+    - name: "PRE | Display ZooKeeper health"
+      ansible.builtin.debug:
+        msg: "ZooKeeper health: {{ zk_health.stdout }} on {{ ansible_fqdn }}"
+
+    # ------------------------------------------------------------------
+    # Create SCRAM-SHA-256 users
+    # ------------------------------------------------------------------
+    - name: "USER | Create SCRAM-SHA-256 credentials for {{ item.username }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ zookeeper_install_dir }}/bin/kafka-configs"
+          - "--zookeeper"
+          - "localhost:{{ zookeeper_client_port }}"
+          - "--alter"
+          - "--add-config"
+          - "SCRAM-SHA-256=[iterations=8192,password={{ item.password }}]"
+          - "--entity-type"
+          - "users"
+          - "--entity-name"
+          - "{{ item.username }}"
+      loop: "{{ kafka_scram_users }}"
+      register: create_results
+      changed_when: true
+      no_log: true
+
+    - name: "USER | Display creation results"
+      ansible.builtin.debug:
+        msg: "Created user: {{ item.item.username }} — {{ item.stdout }}"
+      loop: "{{ create_results.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+
+    # ------------------------------------------------------------------
+    # Verify users were created
+    # ------------------------------------------------------------------
+    - name: "VERIFY | Describe all created users"
+      ansible.builtin.command:
+        argv:
+          - "{{ zookeeper_install_dir }}/bin/kafka-configs"
+          - "--zookeeper"
+          - "localhost:{{ zookeeper_client_port }}"
+          - "--describe"
+          - "--entity-type"
+          - "users"
+          - "--entity-name"
+          - "{{ item.username }}"
+      loop: "{{ kafka_scram_users }}"
+      register: verify_results
+      changed_when: false
+      loop_control:
+        label: "{{ item.username }}"
+
+    - name: "VERIFY | Display user configs"
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ verify_results.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+
+    # ------------------------------------------------------------------
+    # Test connectivity using created credentials
+    # ------------------------------------------------------------------
+    - name: "TEST | Verify admin user can authenticate to broker"
+      ansible.builtin.command:
+        argv:
+          - "{{ zookeeper_install_dir }}/bin/kafka-broker-api-versions"
+          - "--bootstrap-server"
+          - "{{ ansible_fqdn }}:{{ kafka_sasl_ssl_port | default(9093) }}"
+          - "--command-config"
+          - "/tmp/test-client.properties"
+      environment:
+        KAFKA_OPTS: ""
+      vars:
+        test_config: |
+          security.protocol=SASL_SSL
+          sasl.mechanism=SCRAM-SHA-256
+          sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="{{ kafka_admin_username }}" password="{{ kafka_admin_password }}";
+          ssl.truststore.location={{ ssl_truststore_location | default('/opt/ssl/truststore.jks') }}
+          ssl.truststore.password={{ ssl_truststore_password | default('changeit') }}
+          ssl.endpoint.identification.algorithm=
+      block:
+        - name: "TEST | Write temp client config"
+          ansible.builtin.copy:
+            content: "{{ test_config }}"
+            dest: /tmp/test-client.properties
+            mode: "0600"
+          no_log: true
+
+        - name: "TEST | Run broker API versions check"
+          ansible.builtin.command:
+            argv:
+              - "{{ zookeeper_install_dir }}/bin/kafka-broker-api-versions"
+              - "--bootstrap-server"
+              - "{{ ansible_fqdn }}:{{ kafka_sasl_ssl_port | default(9093) }}"
+              - "--command-config"
+              - "/tmp/test-client.properties"
+          register: api_check
+          changed_when: false
+          failed_when: false
+
+        - name: "TEST | Display connectivity result"
+          ansible.builtin.debug:
+            msg: "Broker connectivity: {{ 'SUCCESS' if api_check.rc == 0 else 'FAILED — check broker is running' }}"
+
+      always:
+        - name: "TEST | Remove temp client config"
+          ansible.builtin.file:
+            path: /tmp/test-client.properties
+            state: absent
+
+    - name: "COMPLETE | User creation summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Kafka SCRAM User Creation Complete
+          ============================================
+          ZooKeeper: {{ ansible_fqdn }}
+          Users created:
+          {% for user in kafka_scram_users %}
+          - {{ user.username }} ({{ user.description }})
+          {% endfor %}
+          ============================================

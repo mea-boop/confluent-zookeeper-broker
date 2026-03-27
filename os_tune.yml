@@ -1,0 +1,59 @@
+---
+# ==============================================================================
+# OS Tuning — limits, sysctl, THP, firewall
+# Source: ulimi_firewall_sysctl.yml (repo 2)
+# ==============================================================================
+
+- name: "OS_TUNE | Update security limits"
+  community.general.pam_limits:
+    domain: "*"
+    limit_type: "{{ item.type }}"
+    limit_item: "{{ item.item }}"
+    value: "500000"
+  loop:
+    - { type: soft, item: nofile }
+    - { type: hard, item: nofile }
+    - { type: soft, item: nproc }
+    - { type: hard, item: nproc }
+
+- name: "OS_TUNE | Disable Transparent Huge Pages (runtime)"
+  ansible.builtin.shell:
+    cmd: |
+      echo never > /sys/kernel/mm/transparent_hugepage/enabled
+      echo never > /sys/kernel/mm/transparent_hugepage/defrag
+  changed_when: true
+
+- name: "OS_TUNE | Persist THP disable via rc.local"
+  ansible.builtin.lineinfile:
+    path: /etc/rc.d/rc.local
+    line: "{{ item }}"
+    create: true
+    mode: "0755"
+  loop:
+    - "echo never > /sys/kernel/mm/transparent_hugepage/enabled"
+    - "echo never > /sys/kernel/mm/transparent_hugepage/defrag"
+
+- name: "OS_TUNE | Stop and disable firewalld"
+  ansible.builtin.service:
+    name: firewalld
+    state: stopped
+    enabled: false
+  ignore_errors: true
+  when: configure_firewall | bool == false
+
+- name: "OS_TUNE | Apply sysctl settings"
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    reload: true
+    state: present
+  loop:
+    - { key: vm.swappiness,                value: "1" }
+    - { key: net.ipv4.tcp_retries2,        value: "8" }
+    - { key: net.ipv4.ip_local_port_range,  value: "1024 65000" }
+    - { key: fs.file-max,                  value: "1000000" }
+    - { key: vm.dirty_ratio,               value: "60" }
+    - { key: vm.dirty_background_ratio,    value: "5" }
+    - { key: net.core.rmem_max,            value: "2097152" }
+    - { key: net.core.wmem_max,            value: "2097152" }

@@ -1,0 +1,54 @@
+---
+# ==============================================================================
+# Validate ZooKeeper deployment
+# ==============================================================================
+
+- name: "VALIDATE | Check service status"
+  ansible.builtin.systemd:
+    name: "{{ zookeeper_service_name }}"
+  register: zk_status
+
+- name: "VALIDATE | Assert service is running"
+  ansible.builtin.assert:
+    that:
+      - zk_status.status.ActiveState == "active"
+    fail_msg: "ZooKeeper service is NOT running on {{ ansible_fqdn }}"
+    success_msg: "ZooKeeper service is active on {{ ansible_fqdn }}"
+
+- name: "VALIDATE | Check health via ruok"
+  ansible.builtin.shell:
+    cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+  register: health
+  retries: 5
+  delay: 10
+  until: health.stdout == "imok"
+  changed_when: false
+
+- name: "VALIDATE | Get ZooKeeper mode"
+  ansible.builtin.shell:
+    cmd: "echo stat | nc localhost {{ zookeeper_client_port }} | grep Mode"
+  register: zk_mode
+  changed_when: false
+  failed_when: false
+
+- name: "VALIDATE | Display node status"
+  ansible.builtin.debug:
+    msg: |
+      Node  : {{ ansible_fqdn }}
+      ID    : {{ zookeeper_id }}
+      Mode  : {{ zk_mode.stdout | default('unknown') }}
+      Health: {{ health.stdout }}
+
+- name: "VALIDATE | Check Prometheus metrics endpoint"
+  ansible.builtin.uri:
+    url: "http://localhost:{{ prometheus_jmx_exporter_port }}/metrics"
+    return_content: false
+    status_code: 200
+  register: prometheus_check
+  failed_when: false
+  when: prometheus_jmx_exporter_enabled | bool
+
+- name: "VALIDATE | Display Prometheus status"
+  ansible.builtin.debug:
+    msg: "Prometheus metrics: {{ 'AVAILABLE' if prometheus_check.status == 200 else 'NOT AVAILABLE' }}"
+  when: prometheus_jmx_exporter_enabled | bool

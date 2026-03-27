@@ -1,0 +1,383 @@
+---
+# ==============================================================================
+# Confluent ZooKeeper Version Upgrade Playbook
+# Strategy: Rolling upgrade — one node at a time, followers first, leader last
+#
+# Usage:
+#   ansible-playbook upgrade_zookeeper.yml \
+#     -e "target_confluent_version=7.8.0" \
+#     -e "target_confluent_package=confluent-7.8.0.tar.gz"
+#
+# AAP: Pass extra vars target_confluent_version and target_confluent_package
+#      in the Job Template survey or extra vars field
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Play 1 — Pre-flight checks
+# ------------------------------------------------------------------------------
+- name: Pre-flight Checks
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: true
+  serial: 100%
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+    - ../roles/vars/secret.yml
+
+  tasks:
+    - name: "PREFLIGHT | Validate required upgrade vars are set"
+      ansible.builtin.assert:
+        that:
+          - target_confluent_version is defined
+          - target_confluent_version | length > 0
+          - target_confluent_package is defined
+          - target_confluent_package | length > 0
+        fail_msg: >-
+          Required vars missing. Pass:
+          -e "target_confluent_version=7.8.0"
+          -e "target_confluent_package=confluent-7.8.0.tar.gz"
+      run_once: true
+
+    - name: "PREFLIGHT | Check current installed version"
+      ansible.builtin.shell:
+        cmd: "{{ zookeeper_install_dir }}/bin/zookeeper-server-start --version 2>&1 | head -1 || echo 'unknown'"
+      register: current_version
+      changed_when: false
+      failed_when: false
+
+    - name: "PREFLIGHT | Display upgrade plan"
+      ansible.builtin.debug:
+        msg:
+          - "Host          : {{ ansible_fqdn }}"
+          - "Current ver   : {{ current_version.stdout | default('unknown') }}"
+          - "Target ver    : {{ target_confluent_version }}"
+          - "Install dir   : {{ zookeeper_install_dir }}"
+          - "Package       : {{ target_confluent_package }}"
+      run_once: true
+
+    - name: "PREFLIGHT | Verify ZooKeeper is healthy before upgrade"
+      ansible.builtin.shell:
+        cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+      register: zk_health
+      changed_when: false
+      failed_when: zk_health.stdout != "imok"
+
+    - name: "PREFLIGHT | Get ZooKeeper mode"
+      ansible.builtin.shell:
+        cmd: "echo stat | nc localhost {{ zookeeper_client_port }} | grep Mode | awk '{print $2}'"
+      register: zk_mode
+      changed_when: false
+      failed_when: false
+
+    - name: "PREFLIGHT | Set node role facts"
+      ansible.builtin.set_fact:
+        zookeeper_role: "{{ zk_mode.stdout | default('unknown') }}"
+        is_leader: "{{ (zk_mode.stdout | default('')) == 'leader' }}"
+        is_follower: "{{ (zk_mode.stdout | default('')) == 'follower' }}"
+        cacheable: true
+
+    - name: "PREFLIGHT | Display cluster state before upgrade"
+      ansible.builtin.debug:
+        msg: "{{ ansible_fqdn }} — role: {{ zookeeper_role }}"
+
+# ------------------------------------------------------------------------------
+# Play 2 — Upgrade followers (serial 1)
+# ------------------------------------------------------------------------------
+- name: Upgrade Followers
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+    - ../roles/vars/secret.yml
+
+  tasks:
+    - name: "UPGRADE FOLLOWER | Rolling upgrade"
+      when: is_follower | default(false) | bool
+      block:
+        - name: "UPGRADE FOLLOWER | Display upgrade start"
+          ansible.builtin.debug:
+            msg: "Upgrading FOLLOWER: {{ ansible_fqdn }} to {{ target_confluent_version }}"
+
+        - name: "UPGRADE FOLLOWER | Stop ZooKeeper service"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: stopped
+
+        - name: "UPGRADE FOLLOWER | Wait for port to close"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: stopped
+            timeout: 60
+
+        - name: "UPGRADE FOLLOWER | Backup current install"
+          ansible.builtin.command:
+            cmd: >
+              cp -r {{ zookeeper_install_dir }}
+              {{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}
+            creates: "{{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}"
+
+        - name: "UPGRADE FOLLOWER | Check if new package already in software cache"
+          ansible.builtin.stat:
+            path: "{{ zk_software_dir }}/{{ target_confluent_package }}"
+          register: new_pkg_stat
+
+        - name: "UPGRADE FOLLOWER | Download new Confluent package to software cache"
+          ansible.builtin.command:
+            argv:
+              - curl
+              - "--silent"
+              - "--fail"
+              - "--show-error"
+              - "--retry"
+              - "3"
+              - "--retry-delay"
+              - "5"
+              - "--output"
+              - "{{ zk_software_dir }}/{{ target_confluent_package }}"
+              - "--user"
+              - "{{ artifactory_user }}:{{ artifactory_password }}"
+              - "{{ artifactory_base_url }}/{{ artifactory_repo }}/confluent/{{ target_confluent_package }}"
+          when: not new_pkg_stat.stat.exists
+          changed_when: true
+          no_log: true
+
+        - name: "UPGRADE FOLLOWER | Extract new package from software cache"
+          ansible.builtin.unarchive:
+            src: "{{ zk_software_dir }}/{{ target_confluent_package }}"
+            dest: "{{ zookeeper_install_dir }}"
+            remote_src: true
+            owner: "{{ zookeeper_user }}"
+            group: "{{ zookeeper_group }}"
+            extra_opts:
+              - "--strip-components=1"
+
+        - name: "UPGRADE FOLLOWER | Start ZooKeeper service"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: started
+
+        - name: "UPGRADE FOLLOWER | Wait for port to open"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: started
+            delay: 10
+            timeout: 120
+
+        - name: "UPGRADE FOLLOWER | Wait for stabilization"
+          ansible.builtin.pause:
+            seconds: "{{ restart_wait_time }}"
+
+        - name: "UPGRADE FOLLOWER | Verify health after upgrade"
+          ansible.builtin.shell:
+            cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+          register: health_check
+          retries: "{{ restart_max_retries }}"
+          delay: "{{ restart_retry_delay }}"
+          until: health_check.stdout == "imok"
+          changed_when: false
+
+        - name: "UPGRADE FOLLOWER | Confirm upgrade success"
+          ansible.builtin.debug:
+            msg: "✓ {{ ansible_fqdn }} upgraded to {{ target_confluent_version }}"
+
+      rescue:
+        - name: "UPGRADE FOLLOWER | ROLLBACK — restore previous version"
+          ansible.builtin.command:
+            cmd: >
+              rsync -a --delete
+              {{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}/
+              {{ zookeeper_install_dir }}/
+          changed_when: true
+
+        - name: "UPGRADE FOLLOWER | ROLLBACK — restart with old version"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: started
+
+        - name: "UPGRADE FOLLOWER | ROLLBACK — fail play after rollback"
+          ansible.builtin.fail:
+            msg: "Upgrade FAILED on {{ ansible_fqdn }} — rolled back to {{ confluent_package_version }}"
+
+# ------------------------------------------------------------------------------
+# Play 3 — Upgrade leader last (serial 1)
+# ------------------------------------------------------------------------------
+- name: Upgrade Leader
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+    - ../roles/vars/secret.yml
+
+  tasks:
+    - name: "UPGRADE LEADER | Rolling upgrade"
+      when: is_leader | default(false) | bool
+      block:
+        - name: "UPGRADE LEADER | Display upgrade start"
+          ansible.builtin.debug:
+            msg: "Upgrading LEADER: {{ ansible_fqdn }} — new leader election will occur"
+
+        - name: "UPGRADE LEADER | Pre-leader pause"
+          ansible.builtin.pause:
+            seconds: 10
+
+        - name: "UPGRADE LEADER | Stop ZooKeeper service"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: stopped
+
+        - name: "UPGRADE LEADER | Wait for port to close"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: stopped
+            timeout: 60
+
+        - name: "UPGRADE LEADER | Backup current install"
+          ansible.builtin.command:
+            cmd: >
+              cp -r {{ zookeeper_install_dir }}
+              {{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}
+            creates: "{{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}"
+
+        - name: "UPGRADE LEADER | Check if new package already in software cache"
+          ansible.builtin.stat:
+            path: "{{ zk_software_dir }}/{{ target_confluent_package }}"
+          register: new_pkg_stat_leader
+
+        - name: "UPGRADE LEADER | Download new Confluent package to software cache"
+          ansible.builtin.command:
+            argv:
+              - curl
+              - "--silent"
+              - "--fail"
+              - "--show-error"
+              - "--retry"
+              - "3"
+              - "--retry-delay"
+              - "5"
+              - "--output"
+              - "{{ zk_software_dir }}/{{ target_confluent_package }}"
+              - "--user"
+              - "{{ artifactory_user }}:{{ artifactory_password }}"
+              - "{{ artifactory_base_url }}/{{ artifactory_repo }}/confluent/{{ target_confluent_package }}"
+          when: not new_pkg_stat_leader.stat.exists
+          changed_when: true
+          no_log: true
+
+        - name: "UPGRADE LEADER | Extract new package from software cache"
+          ansible.builtin.unarchive:
+            src: "{{ zk_software_dir }}/{{ target_confluent_package }}"
+            dest: "{{ zookeeper_install_dir }}"
+            remote_src: true
+            owner: "{{ zookeeper_user }}"
+            group: "{{ zookeeper_group }}"
+            extra_opts:
+              - "--strip-components=1"
+
+        - name: "UPGRADE LEADER | Start ZooKeeper service"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: started
+
+        - name: "UPGRADE LEADER | Wait for port to open"
+          ansible.builtin.wait_for:
+            host: "{{ ansible_fqdn }}"
+            port: "{{ zookeeper_client_port }}"
+            state: started
+            delay: 10
+            timeout: 120
+
+        - name: "UPGRADE LEADER | Wait for leader election"
+          ansible.builtin.pause:
+            seconds: 15
+
+        - name: "UPGRADE LEADER | Verify health after upgrade"
+          ansible.builtin.shell:
+            cmd: "echo ruok | nc localhost {{ zookeeper_client_port }}"
+          register: health_check
+          retries: "{{ restart_max_retries }}"
+          delay: "{{ restart_retry_delay }}"
+          until: health_check.stdout == "imok"
+          changed_when: false
+
+        - name: "UPGRADE LEADER | Confirm upgrade success"
+          ansible.builtin.debug:
+            msg: "✓ {{ ansible_fqdn }} (leader) upgraded to {{ target_confluent_version }}"
+
+      rescue:
+        - name: "UPGRADE LEADER | ROLLBACK — restore previous version"
+          ansible.builtin.command:
+            cmd: >
+              rsync -a --delete
+              {{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}/
+              {{ zookeeper_install_dir }}/
+          changed_when: true
+
+        - name: "UPGRADE LEADER | ROLLBACK — restart with old version"
+          ansible.builtin.systemd:
+            name: "{{ zookeeper_service_name }}"
+            state: started
+
+        - name: "UPGRADE LEADER | ROLLBACK — fail play after rollback"
+          ansible.builtin.fail:
+            msg: "Upgrade FAILED on {{ ansible_fqdn }} — rolled back to {{ confluent_package_version }}"
+
+# ------------------------------------------------------------------------------
+# Play 4 — Post-upgrade verification and cleanup
+# ------------------------------------------------------------------------------
+- name: Post-Upgrade Verification
+  hosts: zookeeper_nodes
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - ../group_vars/zookeeper_nodes.yml
+
+  tasks:
+    - name: "POSTCHECK | Verify service is active"
+      ansible.builtin.systemd:
+        name: "{{ zookeeper_service_name }}"
+      register: final_status
+
+    - name: "POSTCHECK | Assert ZooKeeper is running"
+      ansible.builtin.assert:
+        that:
+          - final_status.status.ActiveState == "active"
+        fail_msg: "ZooKeeper NOT running on {{ ansible_fqdn }} after upgrade"
+        success_msg: "ZooKeeper active on {{ ansible_fqdn }}"
+
+    - name: "POSTCHECK | Get ZooKeeper mode"
+      ansible.builtin.shell:
+        cmd: "echo stat | nc localhost {{ zookeeper_client_port }} | grep Mode"
+      register: final_mode
+      changed_when: false
+      failed_when: false
+
+    - name: "POSTCHECK | Clean up backup directories"
+      ansible.builtin.file:
+        path: "{{ zookeeper_install_dir }}.bak.{{ confluent_package_version }}"
+        state: absent
+      when: final_status.status.ActiveState == "active"
+
+    - name: "POSTCHECK | Upgrade summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          ZooKeeper Upgrade Complete
+          ============================================
+          {% for host in groups['zookeeper_nodes'] %}
+          - {{ hostvars[host]['ansible_fqdn'] }}: {{ hostvars[host]['final_mode']['stdout'] | default('unknown') }}
+          {% endfor %}
+          Old version : {{ confluent_package_version }}
+          New version : {{ target_confluent_version }}
+          ============================================
+      run_once: true
