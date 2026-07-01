@@ -1,18 +1,382 @@
 ---
 # ==============================================================================
-# Deploy systemd service unit
+# Dynatrace OneAgent — Uninstall Old Version and Install New Version
+# Applies to: zookeeper_nodes, broker_nodes, c3_nodes
+#
+# AAP Extra Vars required:
+#   dynatrace_host_group    — e.g. eeh-kafka-qa-centralus
+#   dynatrace_network_zone  — e.g. humana.azure.centralus
+#   dynatrace_action        — "install" | "uninstall" | "upgrade"
+#
+# Vars required in vars file:
+#   dynatrace_install_dir      — software cache dir e.g. /app/zookeeper/dynatrace
+#   dynatrace_oneagent_dir     — OneAgent runtime   e.g. /opt/dynatrace/oneagent
+#   dynatrace_oneagent_extra_dir — secondary paths  e.g. /app/zookeeper/dynatrace/oneagent
+#   dynatrace_runtime_dir      — runtime data dir   e.g. /var/lib/dynatrace/oneagent
+#   dynatrace_installer_url    — Artifactory URL for the OneAgent installer
+#   artifactory_user           — from AAP credential (no_log)
+#   artifactory_password       — from AAP credential (no_log)
+#
+# NOTE: become_method: sudo with become_user: root is required on these hosts.
+#       Plain 'sudo systemctl' does not work — must be 'sudo -u root systemctl'
+#       which maps to become: yes + become_user: root + become_method: sudo
 # ==============================================================================
 
-- name: "SERVICE | Deploy systemd service file"
-  ansible.builtin.template:
-    src: "{{ role_path }}/templates/zookeeper.service.j2"
-    dest: "/etc/systemd/system/{{ zookeeper_service_name }}.service"
+# ------------------------------------------------------------------
+# Step 1 — Ensure log directory exists
+# ------------------------------------------------------------------
+- name: "DYNATRACE | Ensure log directory exists"
+  ansible.builtin.file:
+    path: /app/log/dynatrace
+    state: directory
     owner: root
     group: root
-    mode: "0644"
-    force: true
-  notify: reload systemd
+    mode: "0755"
+  become: yes
+  become_user: root
+  become_method: sudo
 
-- name: "SERVICE | Reload systemd daemon"
-  ansible.builtin.systemd:
-    daemon_reload: true
+- name: "DYNATRACE | Log operation start"
+  ansible.builtin.lineinfile:
+    path: /app/log/dynatrace/bootstrap.log
+    line: "{{ ansible_date_time.iso8601 }} ACTION={{ dynatrace_action | upper }} starting on {{ inventory_hostname }}"
+    create: true
+    mode: "0644"
+
+# ==============================================================================
+# BLOCK A — UNINSTALL
+# Runs when dynatrace_action is "uninstall" or "upgrade"
+# ==============================================================================
+- name: "DYNATRACE | Uninstall block"
+  when: dynatrace_action in ['uninstall', 'upgrade']
+  block:
+
+    # ------------------------------------------------------------------
+    # A1 — Check if OneAgent is installed at runtime path
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Check if OneAgent is installed at runtime path"
+      ansible.builtin.stat:
+        path: "{{ dynatrace_oneagent_dir }}/agent/lib64/liboneagentos.so"
+      register: dynatrace_currently_installed
+
+    - name: "DYNATRACE | Get installed OneAgent version"
+      ansible.builtin.shell:
+        cmd: "{{ dynatrace_oneagent_dir }}/agent/tools/oneagentctl --version 2>/dev/null || echo 'unknown'"
+        executable: /bin/bash
+      register: dynatrace_current_version
+      changed_when: false
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Display current version"
+      ansible.builtin.debug:
+        msg: "Current OneAgent version: {{ dynatrace_current_version.stdout | default('not installed') }}"
+
+    - name: "DYNATRACE | Warn if OneAgent not found at configured path"
+      ansible.builtin.debug:
+        msg: >
+          WARNING: OneAgent not found at {{ dynatrace_oneagent_dir }}.
+          Verify dynatrace_oneagent_dir in vars file. Skipping uninstall.
+      when: not dynatrace_currently_installed.stat.exists
+
+    # ------------------------------------------------------------------
+    # A2 — Stop service using sudo -u root (required on these hosts)
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Stop OneAgent service"
+      ansible.builtin.shell:
+        cmd: "systemctl stop oneagent.service"
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: sudo
+      failed_when: false
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Disable OneAgent service"
+      ansible.builtin.shell:
+        cmd: "systemctl disable oneagent.service"
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: sudo
+      failed_when: false
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Wait for OneAgent service to stop"
+      ansible.builtin.wait_for:
+        timeout: 30
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Confirm service is stopped"
+      ansible.builtin.shell:
+        cmd: "systemctl is-active oneagent.service || true"
+        executable: /bin/bash
+      register: dynatrace_service_state
+      changed_when: false
+      become: yes
+      become_user: root
+      become_method: sudo
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Display service state after stop"
+      ansible.builtin.debug:
+        msg: "OneAgent service state: {{ dynatrace_service_state.stdout | default('unknown') }}"
+      when: dynatrace_currently_installed.stat.exists
+
+    # ------------------------------------------------------------------
+    # A3 — Run official uninstaller as root
+    #      uninstall.sh is -rwxr-x--- root:dtuser (750)
+    #      confluent has no execute permission — must be root
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Run OneAgent uninstaller"
+      ansible.builtin.shell:
+        cmd: "{{ dynatrace_oneagent_dir }}/agent/uninstall.sh"
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: sudo
+      register: dynatrace_uninstall_result
+      changed_when: dynatrace_uninstall_result.rc == 0
+      failed_when: dynatrace_uninstall_result.rc not in [0, 1]
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Log uninstall output"
+      ansible.builtin.lineinfile:
+        path: /app/log/dynatrace/bootstrap.log
+        line: "{{ ansible_date_time.iso8601 }} UNINSTALL | {{ item }}"
+        create: true
+        mode: "0644"
+      loop: "{{ dynatrace_uninstall_result.stdout_lines | default([]) }}"
+      when: dynatrace_currently_installed.stat.exists
+
+    # ------------------------------------------------------------------
+    # A4 — Remove all install and runtime directories
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Remove primary OneAgent install directory"
+      ansible.builtin.file:
+        path: "{{ dynatrace_oneagent_dir }}"
+        state: absent
+      become: yes
+      become_user: root
+      become_method: sudo
+      when: dynatrace_currently_installed.stat.exists
+
+    - name: "DYNATRACE | Remove secondary OneAgent install directory"
+      ansible.builtin.file:
+        path: "{{ dynatrace_oneagent_extra_dir }}"
+        state: absent
+      become: yes
+      become_user: root
+      become_method: sudo
+
+    - name: "DYNATRACE | Remove runtime data directory"
+      ansible.builtin.file:
+        path: "{{ dynatrace_runtime_dir }}"
+        state: absent
+      become: yes
+      become_user: root
+      become_method: sudo
+
+    - name: "DYNATRACE | Remove cached old installer"
+      ansible.builtin.file:
+        path: "{{ dynatrace_install_dir }}/software/dynatrace-oneagent.sh"
+        state: absent
+      become: yes
+      become_user: root
+      become_method: sudo
+
+    # ------------------------------------------------------------------
+    # A5 — Remove systemd unit file and reload
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Remove systemd unit file"
+      ansible.builtin.file:
+        path: /etc/systemd/system/oneagent.service
+        state: absent
+      become: yes
+      become_user: root
+      become_method: sudo
+
+    - name: "DYNATRACE | Reload systemd after unit removal"
+      ansible.builtin.shell:
+        cmd: "systemctl daemon-reload"
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: sudo
+
+    # ------------------------------------------------------------------
+    # A6 — Verify fully removed
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Verify no dynatrace processes remain"
+      ansible.builtin.shell:
+        cmd: "pgrep -fa 'oneagent|dynatrace' | grep -v grep | wc -l"
+        executable: /bin/bash
+      register: dynatrace_remaining_procs
+      changed_when: false
+      failed_when: false
+
+    - name: "DYNATRACE | Assert no processes remain"
+      ansible.builtin.assert:
+        that:
+          - dynatrace_remaining_procs.stdout | int == 0
+        fail_msg: >
+          Dynatrace processes still running after uninstall on {{ inventory_hostname }}.
+          Run: ps -ef | grep -E 'dynatrace|oneagent'
+        success_msg: "All Dynatrace processes confirmed stopped on {{ inventory_hostname }}"
+
+    - name: "DYNATRACE | Assert primary install directory is gone"
+      ansible.builtin.stat:
+        path: "{{ dynatrace_oneagent_dir }}"
+      register: dynatrace_verify_removed
+
+    - name: "DYNATRACE | Confirm OneAgent fully removed"
+      ansible.builtin.assert:
+        that:
+          - not dynatrace_verify_removed.stat.exists
+        fail_msg: "OneAgent directory still present at {{ dynatrace_oneagent_dir }}"
+        success_msg: "OneAgent successfully removed from {{ inventory_hostname }}"
+
+    - name: "DYNATRACE | Log uninstall complete"
+      ansible.builtin.lineinfile:
+        path: /app/log/dynatrace/bootstrap.log
+        line: "{{ ansible_date_time.iso8601 }} UNINSTALL complete on {{ inventory_hostname }}"
+        create: true
+        mode: "0644"
+
+# ==============================================================================
+# BLOCK B — INSTALL
+# Runs when dynatrace_action is "install" or "upgrade"
+# ==============================================================================
+- name: "DYNATRACE | Install block"
+  when: dynatrace_action in ['install', 'upgrade']
+  block:
+
+    # ------------------------------------------------------------------
+    # B1 — Ensure software cache directories exist
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Ensure software cache directories exist"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: yes
+      become_user: root
+      become_method: sudo
+      loop:
+        - "{{ dynatrace_install_dir }}"
+        - "{{ dynatrace_install_dir }}/software"
+
+    # ------------------------------------------------------------------
+    # B2 — Download new installer from Artifactory
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Download new OneAgent installer from Artifactory"
+      ansible.builtin.get_url:
+        url: "{{ dynatrace_installer_url }}"
+        dest: "{{ dynatrace_install_dir }}/software/dynatrace-oneagent.sh"
+        url_username: "{{ artifactory_user }}"
+        url_password: "{{ artifactory_password }}"
+        mode: "0755"
+        owner: root
+        group: root
+        force: "{{ true if dynatrace_action == 'upgrade' else false }}"
+      no_log: true
+      register: dynatrace_download_result
+      retries: 3
+      delay: 10
+      until: dynatrace_download_result is succeeded
+
+    - name: "DYNATRACE | Verify installer was downloaded"
+      ansible.builtin.stat:
+        path: "{{ dynatrace_install_dir }}/software/dynatrace-oneagent.sh"
+      register: dynatrace_installer_stat
+
+    - name: "DYNATRACE | Fail if installer not found after download"
+      ansible.builtin.fail:
+        msg: "Installer not found at {{ dynatrace_install_dir }}/software/dynatrace-oneagent.sh"
+      when: not dynatrace_installer_stat.stat.exists
+
+    # ------------------------------------------------------------------
+    # B3 — Run installer as root
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Run OneAgent installer"
+      ansible.builtin.shell:
+        cmd: >
+          sh {{ dynatrace_install_dir }}/software/dynatrace-oneagent.sh
+          --set-host-group={{ dynatrace_host_group }}
+          --set-host-id-source=ip-addresses
+          --set-network-zone={{ dynatrace_network_zone }}
+          INSTALL_PATH={{ dynatrace_oneagent_dir | dirname }}
+          LOG_PATH=/app/log/dynatrace
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: sudo
+      register: dynatrace_install_result
+      changed_when: dynatrace_install_result.rc == 0
+
+    - name: "DYNATRACE | Log installer output"
+      ansible.builtin.lineinfile:
+        path: /app/log/dynatrace/bootstrap.log
+        line: "{{ ansible_date_time.iso8601 }} INSTALL | {{ item }}"
+        create: true
+        mode: "0644"
+      loop: "{{ dynatrace_install_result.stdout_lines | default([]) }}"
+
+    # ------------------------------------------------------------------
+    # B4 — Wait for OneAgent service to come up
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Wait for OneAgent service to start"
+      ansible.builtin.shell:
+        cmd: "systemctl is-active oneagent.service"
+        executable: /bin/bash
+      become: yes
+      become_user: root
+      become_method: sudo
+      register: dynatrace_service_check
+      retries: 6
+      delay: 10
+      until: dynatrace_service_check.stdout == "active"
+      failed_when: false
+
+    # ------------------------------------------------------------------
+    # B5 — Verify new version
+    # ------------------------------------------------------------------
+    - name: "DYNATRACE | Get new installed version"
+      ansible.builtin.shell:
+        cmd: "{{ dynatrace_oneagent_dir }}/agent/tools/oneagentctl --version 2>/dev/null || echo 'unknown'"
+        executable: /bin/bash
+      register: dynatrace_new_version
+      changed_when: false
+
+    - name: "DYNATRACE | Assert OneAgent service is running"
+      ansible.builtin.assert:
+        that:
+          - dynatrace_service_check.stdout == "active"
+        fail_msg: "OneAgent is NOT running after install on {{ inventory_hostname }}"
+        success_msg: "OneAgent is active on {{ inventory_hostname }} — version: {{ dynatrace_new_version.stdout }}"
+
+    - name: "DYNATRACE | Log install complete"
+      ansible.builtin.lineinfile:
+        path: /app/log/dynatrace/bootstrap.log
+        line: "{{ ansible_date_time.iso8601 }} INSTALL complete — version: {{ dynatrace_new_version.stdout }}"
+        create: true
+        mode: "0644"
+
+# ==============================================================================
+# Final Summary
+# ==============================================================================
+- name: "DYNATRACE | Final summary"
+  ansible.builtin.debug:
+    msg:
+      - "============================================"
+      - "Dynatrace OneAgent — {{ inventory_hostname }}"
+      - "============================================"
+      - "Action            : {{ dynatrace_action | upper }}"
+      - "Host group        : {{ dynatrace_host_group }}"
+      - "Network zone      : {{ dynatrace_network_zone }}"
+      - "Software cache    : {{ dynatrace_install_dir }}"
+      - "OneAgent path     : {{ dynatrace_oneagent_dir }}"
+      - "Version           : {{ dynatrace_new_version.stdout | default(dynatrace_current_version.stdout | default('n/a')) }}"
+      - "Log               : /app/log/dynatrace/bootstrap.log"
+      - "============================================"
